@@ -9,7 +9,7 @@
   import { windowRows, type LaidRow } from "../graph/layout";
 
   import ColumnResize from "./ColumnResize.svelte";
-  import { COLUMNS_KEY, COLUMN_LIMITS, clampColumn, defaultColumns, formatCommitDate, restoreColumns, type HistoryColumn } from "../history/columns";
+  import { COLUMNS_KEY, COLUMN_LIMITS, clampColumn, defaultColumns, restoreColumns, type HistoryColumn } from "../history/columns";
   import { formatDateTime } from "../format/date";
   import { branchTipPlacement, primaryBadge, refItemForBadge, refsByCommit, type RefBadge } from "../history/refs";
   import RefKindIcon from "./RefKindIcon.svelte";
