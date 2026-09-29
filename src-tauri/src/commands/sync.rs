@@ -689,8 +689,28 @@ async fn core_push(
     registry: &mut RepoRegistry,
     request: &PushRequest,
 ) -> Result<OperationStarted, AppError> {
+    let (argv, summary) = prepare_push(runner, registry, request).await?;
+    let operation_id = start_job(
+        app,
+        registry,
+        &request.repo_id,
+        &request.request_id,
+        "push",
+        argv,
+        summary,
+    )
+    .await?;
+    Ok(OperationStarted { operation_id })
+}
+
+// Shared with real-Git regression tests; background execution must use this
+// exact plan so repository push defaults cannot broaden the requested write.
+async fn prepare_push(
+    runner: &GitRunner,
+    registry: &RepoRegistry,
+    request: &PushRequest,
+) -> Result<(Vec<String>, String), AppError> {
     let repo_id = request.repo_id.as_str();
-    let request_id = request.request_id.as_str();
     let session = registry.get(repo_id).ok_or_else(session_missing)?.clone();
     if session.trust != TrustState::Trusted {
         return Err(trust_required("push to remotes"));
@@ -722,9 +742,7 @@ async fn core_push(
             check_remote_name(name)?;
             name.to_string()
         }
-        (None, Some(up)) => remote_name_for(runner, &session.worktree_root)
-            .await
-            .unwrap_or(up.remote.clone()),
+        (None, Some(up)) => up.remote.clone(),
         (None, None) if request.set_upstream => default_remote(runner, registry, repo_id).await?,
         (None, None) => {
             return Err(bad_request(
@@ -732,32 +750,89 @@ async fn core_push(
             ));
         }
     };
-    let source_oid = runner
+    check_remote_name(&name)?;
+    let source = runner
         .run(
             &session.worktree_root,
-            &["rev-parse", "HEAD"],
+            &["rev-parse", "--verify", "HEAD^{commit}"],
             crate::git::READ_TIMEOUT,
         )
         .await
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .unwrap_or_default();
-    let url = checked_remote_url(runner, &session.worktree_root, &name).await?;
-    // Normal push only: never --force/--force-with-lease/--mirror/--all.
-    let mut argv = vec!["push".into(), "--progress".into()];
-    let summary = if upstream.is_none() && request.set_upstream {
-        argv.push("--set-upstream".into());
-        argv.push(name.clone());
-        argv.push(format!("HEAD:{branch}"));
-        format!(
-            "push -u {name} HEAD:{branch} ({url} {})",
-            short_oid(&source_oid)
-        )
+        .map_err(|_| bad_request("Cannot read HEAD"))?;
+    if !source.success {
+        return Err(bad_request("Create a commit before pushing"));
+    }
+    let source_oid = String::from_utf8_lossy(&source.stdout).trim().to_string();
+    let target = if upstream.as_ref().is_some_and(|up| up.remote == name) {
+        let out = runner
+            .run(
+                &session.worktree_root,
+                &["config", "--get-all", &format!("branch.{branch}.merge")],
+                crate::git::READ_TIMEOUT,
+            )
+            .await
+            .map_err(|_| bad_request("Cannot read the upstream branch"))?;
+        let refs = String::from_utf8_lossy(&out.stdout);
+        let refs: Vec<_> = refs.lines().collect();
+        if !out.success || refs.len() != 1 || !refs[0].starts_with("refs/heads/") {
+            return Err(bad_request("Push requires exactly one upstream branch"));
+        }
+        refs[0].to_string()
     } else {
-        format!("push {name} ({url} {})", short_oid(&source_oid))
+        format!("refs/heads/{branch}")
     };
-    let argv = with_bitbucket_username(&url, argv);
-    let operation_id = start_job(app, registry, repo_id, request_id, "push", argv, summary).await?;
-    Ok(OperationStarted { operation_id })
+    let valid_target = runner
+        .run(
+            &session.worktree_root,
+            &["check-ref-format", &target],
+            crate::git::READ_TIMEOUT,
+        )
+        .await
+        .map_err(|_| bad_request("Cannot validate the push branch"))?;
+    if !valid_target.success {
+        return Err(bad_request("The upstream branch is invalid"));
+    }
+
+    // Resolve pushurl and URL rewrites too; validate the actual destination
+    // and refuse multi-destination pushes rather than logging only one URL.
+    let urls = runner
+        .run(
+            &session.worktree_root,
+            &["remote", "get-url", "--push", "--all", "--", &name],
+            crate::git::READ_TIMEOUT,
+        )
+        .await
+        .map_err(|_| bad_request("Cannot read the push URL"))?;
+    if !urls.success {
+        return Err(bad_request("Cannot read the push URL"));
+    }
+    let urls_text = String::from_utf8_lossy(&urls.stdout);
+    let urls: Vec<_> = urls_text.lines().collect();
+    if urls.len() != 1 || urls[0].is_empty() {
+        return Err(bad_request("Push requires exactly one destination URL"));
+    }
+    validate_remote_url(urls[0]).map_err(|_| bad_request("The push URL is not supported"))?;
+    let url = redact_url(urls[0]);
+    let mut argv = vec![
+        "-c".into(),
+        format!("remote.{name}.mirror=false"),
+        "push".into(),
+        "--progress".into(),
+        "--no-force".into(),
+        "--no-follow-tags".into(),
+        "--recurse-submodules=no".into(),
+    ];
+    let set_upstream = upstream.is_none() && request.set_upstream;
+    if set_upstream {
+        argv.push("--set-upstream".into());
+    }
+    argv.extend(["--".into(), name.clone(), format!("HEAD:{target}")]);
+    let summary = format!(
+        "push {}{name} HEAD:{target} ({url} {})",
+        if set_upstream { "-u " } else { "" },
+        short_oid(&source_oid)
+    );
+    Ok((with_bitbucket_username(urls[0], argv), summary))
 }
 
 fn short_oid(oid: &str) -> String {
@@ -1685,7 +1760,233 @@ pub mod prelude {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::commit::tests::{git, open_repo, temp_repo};
     use std::sync::atomic::AtomicBool;
+
+    fn push_fixture(
+        label: &str,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        RepoRegistry,
+        PushRequest,
+    ) {
+        let (root, repo) = temp_repo(&format!("push-{label}-{}", uuid::Uuid::new_v4()));
+        git(&repo, &["config", "user.name", "Fixture"]);
+        git(&repo, &["config", "user.email", "fixture@example.test"]);
+        git(&repo, &["config", "commit.gpgSign", "false"]);
+        std::fs::write(repo.join("base"), "base\n").unwrap();
+        git(&repo, &["add", "base"]);
+        git(&repo, &["commit", "-m", "base"]);
+        git(&repo, &["branch", "side"]);
+        for name in ["origin", "other"] {
+            let path = root.join(format!("{name}.git"));
+            git(&root, &["init", "--bare", path.to_str().unwrap()]);
+            git(&repo, &["remote", "add", name, path.to_str().unwrap()]);
+            git(&repo, &["push", name, "main", "side"]);
+        }
+        git(&repo, &["branch", "--set-upstream-to=origin/main", "main"]);
+        let mut registry = RepoRegistry::default();
+        let repo_id = open_repo(&mut registry, &repo, TrustState::Trusted);
+        let request = PushRequest {
+            request_id: "push-test".into(),
+            expected_version: registry.get(&repo_id).unwrap().version,
+            repo_id,
+            remote: None,
+            set_upstream: false,
+        };
+        (root, repo, registry, request)
+    }
+
+    fn git_text(repo: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    fn advance(repo: &std::path::Path, name: &str) {
+        std::fs::write(repo.join(name), name).unwrap();
+        git(repo, &["add", name]);
+        git(repo, &["commit", "-m", name]);
+    }
+
+    async fn run_push_plan(
+        repo: &std::path::Path,
+        registry: &RepoRegistry,
+        request: &PushRequest,
+    ) -> JobOutcome {
+        let runner = git_runner().unwrap();
+        let (args, _) = prepare_push(&runner, registry, request).await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        execute_remote("git", &args, repo, preset(), tx).await
+    }
+
+    #[tokio::test]
+    async fn push_plan_limits_configured_matching_mirror_and_tags_to_one_branch() {
+        let (root, repo, registry, request) = push_fixture("matching");
+        let origin = root.join("origin.git");
+        let initial = git_text(&origin, &["rev-parse", "main"]);
+        git(&origin, &["branch", "remote-only", "main"]);
+        git(&repo, &["switch", "side"]);
+        advance(&repo, "side-change");
+        git(&repo, &["switch", "main"]);
+        advance(&repo, "main-change");
+        git(
+            &repo,
+            &[
+                "-c",
+                "tag.gpgSign=false",
+                "tag",
+                "-a",
+                "local-tag",
+                "-m",
+                "local tag",
+            ],
+        );
+        git(&repo, &["config", "push.default", "matching"]);
+        git(
+            &repo,
+            &["config", "remote.origin.push", "+refs/heads/*:refs/heads/*"],
+        );
+        git(&repo, &["config", "remote.origin.mirror", "true"]);
+        git(&repo, &["config", "push.followTags", "true"]);
+        git(&repo, &["config", "branch.main.pushRemote", "other"]);
+        git(&repo, &["config", "remote.pushDefault", "other"]);
+        assert_eq!(
+            run_push_plan(&repo, &registry, &request).await,
+            JobOutcome::Ok
+        );
+        assert_eq!(
+            git_text(&origin, &["rev-parse", "main"]),
+            git_text(&repo, &["rev-parse", "HEAD"])
+        );
+        assert_eq!(git_text(&origin, &["rev-parse", "side"]), initial);
+        assert_eq!(git_text(&origin, &["rev-parse", "remote-only"]), initial);
+        assert_eq!(
+            git_text(&root.join("other.git"), &["rev-parse", "main"]),
+            initial
+        );
+        assert!(git_text(&origin, &["tag", "--list"]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn push_plan_honors_explicit_remote_and_differently_named_upstream() {
+        let (root, repo, registry, mut request) = push_fixture("destinations");
+        let origin = root.join("origin.git");
+        let initial = git_text(&origin, &["rev-parse", "main"]);
+        git(&repo, &["push", "origin", "HEAD:refs/heads/release"]);
+        git(
+            &repo,
+            &["config", "branch.main.merge", "refs/heads/release"],
+        );
+        advance(&repo, "new-content");
+        let head = git_text(&repo, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            run_push_plan(&repo, &registry, &request).await,
+            JobOutcome::Ok
+        );
+        assert_eq!(git_text(&origin, &["rev-parse", "release"]), head);
+        assert_eq!(git_text(&origin, &["rev-parse", "main"]), initial);
+        request.remote = Some("other".into());
+        assert_eq!(
+            run_push_plan(&repo, &registry, &request).await,
+            JobOutcome::Ok
+        );
+        assert_eq!(
+            git_text(&root.join("other.git"), &["rev-parse", "main"]),
+            head
+        );
+    }
+
+    #[tokio::test]
+    async fn push_plan_can_set_upstream_on_first_push() {
+        let (_root, repo, registry, mut request) = push_fixture("first");
+        git(&repo, &["switch", "-c", "new-branch"]);
+        advance(&repo, "new-content");
+        request.set_upstream = true;
+        assert_eq!(
+            run_push_plan(&repo, &registry, &request).await,
+            JobOutcome::Ok
+        );
+        assert_eq!(
+            git_text(&repo, &["rev-parse", "--abbrev-ref", "@{upstream}"]),
+            "origin/new-branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_plan_never_forces_a_diverged_remote() {
+        let (root, repo, registry, request) = push_fixture("diverged");
+        advance(&repo, "local-change");
+        git(&repo, &["switch", "-c", "remote-tip", "HEAD~1"]);
+        advance(&repo, "remote-change");
+        git(&repo, &["push", "origin", "HEAD:refs/heads/main"]);
+        let remote_head = git_text(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["switch", "main"]);
+        git(
+            &repo,
+            &[
+                "config",
+                "remote.origin.push",
+                "+refs/heads/main:refs/heads/main",
+            ],
+        );
+        git(&repo, &["config", "remote.origin.mirror", "true"]);
+        assert!(matches!(
+            run_push_plan(&repo, &registry, &request).await,
+            JobOutcome::Failed(_)
+        ));
+        assert_eq!(
+            git_text(&root.join("origin.git"), &["rev-parse", "main"]),
+            remote_head
+        );
+    }
+
+    #[tokio::test]
+    async fn push_plan_validates_pushurl_and_rejects_multiple_destinations() {
+        let (root, repo, registry, request) = push_fixture("urls");
+        let other = root.join("other.git");
+        git(
+            &repo,
+            &["config", "remote.origin.pushurl", other.to_str().unwrap()],
+        );
+        advance(&repo, "only-other");
+        let runner = git_runner().unwrap();
+        let (_, summary) = prepare_push(&runner, &registry, &request).await.unwrap();
+        assert!(summary.contains(other.to_str().unwrap()));
+        assert_eq!(
+            run_push_plan(&repo, &registry, &request).await,
+            JobOutcome::Ok
+        );
+        assert_eq!(
+            git_text(&other, &["rev-parse", "main"]),
+            git_text(&repo, &["rev-parse", "HEAD"])
+        );
+        git(
+            &repo,
+            &[
+                "config",
+                "--add",
+                "remote.origin.pushurl",
+                root.join("origin.git").to_str().unwrap(),
+            ],
+        );
+        assert!(prepare_push(&runner, &registry, &request).await.is_err());
+        git(
+            &repo,
+            &[
+                "config",
+                "--replace-all",
+                "remote.origin.pushurl",
+                "ext::blocked",
+            ],
+        );
+        assert!(prepare_push(&runner, &registry, &request).await.is_err());
+    }
 
     fn preset() -> std::sync::Arc<AtomicBool> {
         std::sync::Arc::new(AtomicBool::new(false))

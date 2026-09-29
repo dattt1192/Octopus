@@ -23,7 +23,7 @@
   const changes = $derived(partitionStatus((files ?? []).filter(f => !f.conflicted)));
   const conflicts = $derived((files ?? []).filter(f => f.conflicted));
   const disabled = $derived(trustBlocked || indexBusy || commitBusy || loading || files === null);
-  const commitHint = $derived(trustBlocked ? "Trust this repository to commit." : conflicts.length ? "Resolve conflicts before committing." : files === null ? "Load working changes first." : amendStale ? "HEAD changed. Turn Amend off and select it again." : changes.staged.length === 0 && !amendOid ? "Stage a file to include it in your commit." : !subject.trim() ? "Write a summary for this commit." : amendOid ? `Replace commit ${amendOid.slice(0, 7)} with this message and the staged changes.` : `${changes.staged.length} staged ${changes.staged.length === 1 ? "file" : "files"} will be committed.`);
+  const commitHint = $derived(trustBlocked ? "Trust this repository to commit." : conflicts.length ? "Resolve conflicts before committing." : files === null ? "Load working changes first." : amendStale ? "HEAD changed or is not verified. Refresh or turn Amend off before continuing." : changes.staged.length === 0 && !amendOid ? "Stage a file to include it in your commit." : !subject.trim() ? "Write a summary for this commit." : amendOid ? `Replace commit ${amendOid.slice(0, 7)} with this message and the staged changes.` : `${changes.staged.length} staged ${changes.staged.length === 1 ? "file" : "files"} will be committed.`);
   const canCommit = $derived(!disabled && !amendLoading && !amendStale && !error && !conflicts.length && (changes.staged.length > 0 || amendOid !== null) && subject.trim() !== "");
   let fileMenu = $state<{ file: ChangedFile; side: FileSide; x: number; y: number } | null>(null);
   function commitKey(event: KeyboardEvent) {
@@ -151,7 +151,7 @@
     Amend last commit
   </label>
   {#if amendLoading}<p class="gd-commit-hint" role="status">Loading last commit…</p>
-  {:else if amendOid}<p class="gd-amend-notice" role="status">{#if amendStale}HEAD changed. Turn Amend off and select it again.{:else}Replaces <code>{amendOid.slice(0, 7)}</code> and rewrites its history. Only amend commits you have not shared.{/if}</p>
+  {:else if amendOid}<p class="gd-amend-notice" role="status">{#if amendStale}HEAD changed or is not verified. Refresh or turn Amend off before continuing.{:else}Replaces <code>{amendOid.slice(0, 7)}</code> and rewrites its history. Only amend commits you have not shared.{/if}</p>
   {:else if amendUnavailable}<p class="gd-commit-hint">{amendUnavailable}</p>{/if}
   <label for={summaryId}>Summary</label>
   <input id={summaryId} aria-label="Commit subject" placeholder="What changed?" value={subject} maxlength="500" disabled={commitBusy || amendLoading} oninput={e => onSubject(e.currentTarget.value)} onkeydown={commitKey} />

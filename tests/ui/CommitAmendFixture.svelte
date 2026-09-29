@@ -7,12 +7,23 @@
   let failRead = $state(false);
   let failCommit = $state(false);
   let slowRead = $state(false);
+  let failSnapshot = $state(false);
+  let lastReword = $state("");
   let generation = $state(0);
   let seed: RepoSnapshot = $state.raw({ ...demoSession, repoId: "amend-fixture", workspaceKey: "fixture:amend" });
   let adapter = $derived.by(() => {
     const base = createMockAdapter(seed);
     return {
       ...base,
+      async repoSnapshot() {
+        if (failSnapshot) throw { code: "IO_ERROR", message: "Fixture: could not refresh HEAD.", recovery: "refresh", retryable: true } satisfies AppError;
+        return base.repoSnapshot();
+      },
+      async rewordMessage(_repoId = "", _version = 0, _oid = "", subject = "", body = "") {
+        if (failCommit) throw { code: "HOOK_FAILED", message: "Fixture: hook refused Reword.", recovery: "inspectState", retryable: false } satisfies AppError;
+        lastReword = JSON.stringify({ subject, body });
+        return base.rewordMessage();
+      },
       async commitDetails(...args: Parameters<typeof base.commitDetails>) {
         if (slowRead) await new Promise(resolve => setTimeout(resolve, 3000));
         if (failRead) throw { code: "GIT_ERROR", message: "Fixture: could not load HEAD.", recovery: "retryRead", retryable: true } satisfies AppError;
@@ -36,9 +47,13 @@
   <label><input type="checkbox" bind:checked={failRead} />Fail loading commit</label>
   <label><input type="checkbox" bind:checked={failCommit} />Fail committing</label>
   <label><input type="checkbox" bind:checked={slowRead} />Slow loading</label>
+  <label><input type="checkbox" bind:checked={failSnapshot} />Fail refreshing HEAD</label>
+  <button onclick={() => generation += 1}>Reopen same workspace</button>
+  <button onclick={() => { seed = { ...seed, head: { kind: "detached", oid: "d".repeat(40) } }; generation += 1; }}>Reopen with changed HEAD</button>
   <button onclick={() => reset(true)}>Reset with unborn HEAD</button>
   <button onclick={() => reset(false)}>Reset with existing HEAD</button>
 </nav>
+{#if lastReword}<output aria-label="Submitted Reword">{lastReword}</output>{/if}
 <main>
   {#key generation}
     <RepositoryWorkspace initialSession={seed} active={true} mockAdapter={adapter}
