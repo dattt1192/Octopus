@@ -70,7 +70,10 @@ fn store_for(app: &AppHandle) -> Result<Store, AppError> {
     Ok(Store::open(&dir))
 }
 
-async fn read_head(runner: &GitRunner, session: &RepoSession) -> Result<HeadState, AppError> {
+pub(crate) async fn read_head(
+    runner: &GitRunner,
+    session: &RepoSession,
+) -> Result<HeadState, AppError> {
     let cwd = &session.worktree_root;
     let symbolic = runner
         .run(cwd, &["symbolic-ref", "-q", "HEAD"], READ_TIMEOUT)

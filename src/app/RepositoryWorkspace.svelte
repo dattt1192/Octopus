@@ -175,6 +175,17 @@
   let commitBusy = $state(false);
   let commitError: AppError | null = $state(null);
   let identityLabel: string | null = $state(null);
+  let amendOid: string | null = $state(null);
+  let amendLoading = $state(false);
+  let newCommitDraft = $state<{ subject: string; body: string } | null>(null);
+  const amendUnavailable = $derived(
+    session?.head.kind === "unborn" ? "Create the first commit before using Amend."
+      : session?.state !== "normal" || session?.mergeOrigin ? "Finish the current Git operation before amending."
+      : null
+  );
+  const amendStale = $derived(amendOid !== null && (
+    session?.head.kind === "unborn" || session?.head.oid !== amendOid || amendUnavailable !== null
+  ));
 
   // Branch dialog (T10).
   let showBranches = $state(false);
@@ -1696,12 +1707,45 @@
     await loadIdentity();
   }
 
+  async function toggleAmend(enabled: boolean): Promise<void> {
+    if (!session || commitBusy || amendLoading) return;
+    commitError = null;
+    if (!enabled) {
+      amendOid = null;
+      if (newCommitDraft) {
+        shell.commitMessage = newCommitDraft.subject;
+        commitBody = newCommitDraft.body;
+        newCommitDraft = null;
+      }
+      return;
+    }
+    if (amendUnavailable || session.head.kind === "unborn") return;
+    const current = session;
+    const oid = session.head.oid;
+    amendLoading = true;
+    try {
+      const details = await historyAdapter().commitDetails(current.repoId, oid, null);
+      if (session?.repoId !== current.repoId) return;
+      if (!("oid" in session.head) || session.head.oid !== oid || details.oid !== oid || amendUnavailable) {
+        throw { code: "STALE_STATE", message: "HEAD changed while loading the commit. Refresh and select Amend again.", recovery: "refresh", retryable: false } satisfies AppError;
+      }
+      newCommitDraft = { subject: shell.commitMessage, body: commitBody };
+      shell.commitMessage = details.subject;
+      commitBody = details.body;
+      amendOid = oid;
+    } catch (error) {
+      commitError = error as AppError;
+    } finally {
+      amendLoading = false;
+    }
+  }
+
   /**
    * Commit exactly the index. The draft (subject + body) survives every
    * failure and clears only on success; the selection clears with it.
    */
   async function commitSelected(): Promise<void> {
-    if (!session || commitBusy) return;
+    if (!session || commitBusy || amendLoading || amendStale || indexBusy || statusLoading) return;
     const current = session;
     const subject = shell.commitMessage;
     if (subject.trim() === "") return;
@@ -1712,12 +1756,15 @@
         current.repoId,
         current.version,
         subject,
-        commitBody
+        commitBody,
+        amendOid
       );
       if (session === null || session.repoId !== current.repoId) return;
       session = result.snapshot;
-      shell.commitMessage = "";
-      commitBody = "";
+      shell.commitMessage = newCommitDraft?.subject ?? "";
+      commitBody = newCommitDraft?.body ?? "";
+      amendOid = null;
+      newCommitDraft = null;
       clearDiff();
       await reloadAfterMutation();
     } catch (e) {
@@ -2500,7 +2547,7 @@
     if (!session) return;
     const next: WorkspaceState = {
       snapshot: session,
-      busy: busy || indexBusy || discardBusy || commitBusy || branchBusy || syncJobActive || mergeBusy || conflictBusy !== null || stashSaveBusy || stashBusyEntry !== null,
+      busy: busy || indexBusy || discardBusy || commitBusy || amendLoading || branchBusy || syncJobActive || mergeBusy || conflictBusy !== null || stashSaveBusy || stashBusyEntry !== null,
       hasDraft: !!(shell.commitMessage.trim() || commitBody.trim()),
       changedFiles: statusFiles?.length ?? null,
       hasError: !!(sessionError || indexError || commitError || syncError || conflictActionError),
@@ -2763,6 +2810,11 @@
         {commitBody}
         {commitBusy}
         {commitError}
+        {amendOid}
+        {amendLoading}
+        {amendUnavailable}
+        {amendStale}
+        onAmend={(enabled) => void toggleAmend(enabled)}
         {identityLabel}
         headDetached={session.head.kind === "detached"}
         onCommitBody={(value) => (commitBody = value)}

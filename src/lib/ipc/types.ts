@@ -406,6 +406,16 @@ export interface CommitResult {
   snapshot: RepoSnapshot;
 }
 
+export interface CommitCreateRequest {
+  requestId: RequestId;
+  repoId: RepoId;
+  expectedVersion: Version;
+  subject: string;
+  body: string;
+  /** Null creates a commit; an OID replaces only that exact HEAD. */
+  amendOid: Oid | null;
+}
+
 export interface BranchCreateResult {
   snapshot: RepoSnapshot;
   switched: boolean;

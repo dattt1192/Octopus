@@ -121,8 +121,31 @@ pub async fn commit_staged(
     cwd: &Path,
     message: &[u8],
 ) -> Result<String, CommitError> {
+    commit_index(runner, cwd, message, false).await
+}
+
+/// Replace HEAD with the index, preserving its parents and original author.
+pub async fn amend_staged(
+    runner: &GitRunner,
+    cwd: &Path,
+    message: &[u8],
+) -> Result<String, CommitError> {
+    commit_index(runner, cwd, message, true).await
+}
+
+async fn commit_index(
+    runner: &GitRunner,
+    cwd: &Path,
+    message: &[u8],
+    amend: bool,
+) -> Result<String, CommitError> {
+    let args = if amend {
+        &["commit", "--amend", "-F", "-"][..]
+    } else {
+        &["commit", "-F", "-"][..]
+    };
     let out = runner
-        .run_with_stdin(cwd, &["commit", "-F", "-"], message, WRITE_TIMEOUT)
+        .run_with_stdin(cwd, args, message, WRITE_TIMEOUT)
         .await?;
     if !out.success {
         let mut message = String::from_utf8_lossy(&out.stderr).into_owned();
