@@ -65,6 +65,7 @@
 
   import { SearchController } from "../lib/search/controller";
   import { clampWidth, initialShell, SHELL_LIMITS, type InspectorState } from "../lib/state/shell";
+  import { canResumeAmend, readCommitDraft } from "../lib/state/commit-draft";
   import { layoutGraph } from "../lib/graph/layout";
   import { headLabel } from "../mocks/demoSession";
 
@@ -182,6 +183,18 @@
   let commitBusy = $state(false);
   let commitError: AppError | null = $state(null);
   let identityLabel: string | null = $state(null);
+  let amendOid: string | null = $state(null);
+  let amendLoading = $state(false);
+  let amendNeedsValidation = $state(false);
+  let newCommitDraft = $state<{ subject: string; body: string } | null>(null);
+  const amendUnavailable = $derived(
+    session?.head.kind === "unborn" ? "Create the first commit before using Amend."
+      : session?.state !== "normal" || session?.mergeOrigin ? "Finish the current Git operation before amending."
+      : null
+  );
+  const amendStale = $derived(amendOid !== null && (
+    amendNeedsValidation || !session || !canResumeAmend(amendOid, session)
+  ));
 
   // Branch dialog (T10).
   let showBranches = $state(false);
@@ -209,6 +222,7 @@
   // Commit history actions (T18): one modal per action except create-branch.
   let historyAction: { action: CommitActionId; row: CommitRow } | null = $state(null);
   let historyActionBusy = $state(false);
+  let historyMessage: { subject: string; body: string } | null = $state(null);
   let historyActionError: AppError | null = $state(null);
   let historyConfirmSummary: string | null = $state(null);
   let historyConfirmToken: string | null = $state(null);
@@ -414,18 +428,31 @@
     await loadStatus();
   }
 
-  async function refreshActivatedRepository(): Promise<void> {
+  async function refreshActivatedRepository(reloadHistory = true): Promise<void> {
     const current = session;
     if (!current || busy || indexBusy || commitBusy || branchBusy || syncJobActive || mergeBusy || conflictBusy || stashSaveBusy || stashBusyEntry) return;
     try {
-      const fresh = demo ? await mockAdapter.repoSnapshot() : await realAdapter.repoSnapshot(current.repoId, false);
+      const fresh = demo ? await mockAdapter.repoSnapshot() : await realAdapter.repoSnapshot(current.repoId, amendNeedsValidation);
       if (disposed) return;
       const headChanged = JSON.stringify(current.head) !== JSON.stringify(fresh.head);
       session = fresh;
+      if (amendNeedsValidation) {
+        amendNeedsValidation = false;
+        sessionError = null;
+        commitError = null;
+        if (amendOid && !canResumeAmend(amendOid, fresh)) {
+          commitError = { code: "STALE_STATE", message: "HEAD changed while Octopus was closed. Your amend draft is preserved; turn Amend off to restore your new-commit draft.", recovery: "inspectState", retryable: false };
+        }
+      }
       await refreshStatusQuiet();
       await loadRemoteStatus();
-      if (headChanged) await loadHistory(true);
-    } catch (e) { if (!disposed) sessionError = e as AppError; }
+      if (headChanged && reloadHistory) await loadHistory(true);
+    } catch (e) {
+      if (!disposed) {
+        sessionError = e as AppError;
+        if (amendNeedsValidation) commitError = { ...(e as AppError), message: "Could not verify HEAD for the saved amend draft. Refresh working changes to retry, or turn Amend off." };
+      }
+    }
   }
 
   function unsubscribeInvalidated(): void {
@@ -814,7 +841,7 @@
     if (!session) return;
     try {
       const drafts = readJson(DRAFTS_KEY);
-      drafts[session.workspaceKey] = { subject: shell.commitMessage, body: commitBody };
+      drafts[session.workspaceKey] = { subject: shell.commitMessage, body: commitBody, amendOid, newCommitDraft };
       localStorage.setItem(DRAFTS_KEY, JSON.stringify(drafts));
     } catch {
       // Drafts are best-effort; the commit boxes always work without them.
@@ -822,11 +849,12 @@
   }
 
   function restoreDraft(workspaceKey: string): void {
-    const entry = (readJson(DRAFTS_KEY)[workspaceKey] ?? readJson("gitdock.drafts.v1")[session?.repoId ?? ""]) as
-      | { subject?: unknown; body?: unknown }
-      | undefined;
-    shell.commitMessage = typeof entry?.subject === "string" ? entry.subject : "";
-    commitBody = typeof entry?.body === "string" ? entry.body : "";
+    const entry = readCommitDraft(readJson(DRAFTS_KEY)[workspaceKey] ?? readJson("gitdock.drafts.v1")[session?.repoId ?? ""]);
+    shell.commitMessage = entry.subject;
+    commitBody = entry.body;
+    amendOid = entry.amendOid;
+    newCommitDraft = entry.newCommitDraft;
+    amendNeedsValidation = amendOid !== null;
   }
 
   function persistWidths(): void {
@@ -1898,12 +1926,47 @@
     await loadIdentity();
   }
 
+  async function toggleAmend(enabled: boolean): Promise<void> {
+    if (!session || commitBusy || amendLoading) return;
+    commitError = null;
+    if (!enabled) {
+      amendOid = null;
+      amendNeedsValidation = false;
+      if (newCommitDraft) {
+        shell.commitMessage = newCommitDraft.subject;
+        commitBody = newCommitDraft.body;
+        newCommitDraft = null;
+      }
+      return;
+    }
+    if (amendUnavailable || session.head.kind === "unborn") return;
+    const current = session;
+    const oid = session.head.oid;
+    amendLoading = true;
+    try {
+      const details = await historyAdapter().commitDetails(current.repoId, oid, null);
+      if (session?.repoId !== current.repoId) return;
+      if (!("oid" in session.head) || session.head.oid !== oid || details.oid !== oid || amendUnavailable) {
+        throw { code: "STALE_STATE", message: "HEAD changed while loading the commit. Refresh and select Amend again.", recovery: "refresh", retryable: false } satisfies AppError;
+      }
+      newCommitDraft = { subject: shell.commitMessage, body: commitBody };
+      shell.commitMessage = details.subject;
+      commitBody = details.body;
+      amendOid = oid;
+      amendNeedsValidation = false;
+    } catch (error) {
+      commitError = error as AppError;
+    } finally {
+      amendLoading = false;
+    }
+  }
+
   /**
    * Commit exactly the index. The draft (subject + body) survives every
    * failure and clears only on success; the selection clears with it.
    */
   async function commitSelected(): Promise<void> {
-    if (!session || commitBusy) return;
+    if (!session || commitBusy || amendLoading || amendStale || indexBusy || statusLoading) return;
     const current = session;
     const subject = shell.commitMessage;
     if (subject.trim() === "") return;
@@ -1914,12 +1977,15 @@
         current.repoId,
         current.version,
         subject,
-        commitBody
+        commitBody,
+        amendOid
       );
       if (session === null || session.repoId !== current.repoId) return;
       session = result.snapshot;
-      shell.commitMessage = "";
-      commitBody = "";
+      shell.commitMessage = newCommitDraft?.subject ?? "";
+      commitBody = newCommitDraft?.body ?? "";
+      amendOid = null;
+      newCommitDraft = null;
       clearDiff();
       await reloadAfterMutation();
     } catch (e) {
@@ -1976,32 +2042,43 @@
     if (!session) return;
     const current = session;
     historyAction = { action, row };
+    const opening = historyAction;
+    historyMessage = null;
     historyActionError = null;
     historyConfirmSummary = null;
     historyConfirmToken = null;
     const form = COMMIT_ACTION_FORMS[action];
-    if (!form.confirmAction) return;
+    if (!form.confirmAction && action !== "reword") return;
     historyActionBusy = true;
     try {
+      if (action === "reword") {
+        const details = await historyAdapter().commitDetails(current.repoId, row.oid, null);
+        if (historyAction !== opening || session?.repoId !== current.repoId) return;
+        if (details.oid !== row.oid) throw { code: "STALE_STATE", message: "The selected commit changed. Close and reopen Reword.", recovery: "refresh", retryable: false } satisfies AppError;
+        historyMessage = { subject: details.subject, body: details.body };
+        return;
+      }
       const details = await statusAdapter().confirmationPrepare(
         current.repoId,
         current.version,
-        form.confirmAction,
+        form.confirmAction!,
         [row.oid]
       );
-      if (historyAction?.row.oid !== row.oid || session?.repoId !== current.repoId) return;
+      if (historyAction !== opening || session?.repoId !== current.repoId) return;
       historyConfirmSummary = details.summary;
       historyConfirmToken = details.confirmationToken;
     } catch (e) {
-      if (session?.repoId !== current.repoId) return;
+      if (historyAction !== opening || session?.repoId !== current.repoId) return;
       historyActionError = e as AppError;
     } finally {
-      historyActionBusy = false;
+      if (historyAction === opening) historyActionBusy = false;
     }
   }
 
   function closeHistoryAction(): void {
     historyAction = null;
+    historyMessage = null;
+    historyActionBusy = false;
     historyActionError = null;
     historyConfirmSummary = null;
     historyConfirmToken = null;
@@ -2241,6 +2318,7 @@
     if (!session || !historyAction || historyActionBusy) return;
     const current = session;
     const { action, row } = historyAction;
+    if (action === "reword" && !historyMessage) return;
     const adapter = statusAdapter();
     historyActionBusy = true;
     historyActionError = null;
@@ -2585,6 +2663,11 @@
   }
 
   async function refreshAll(): Promise<void> {
+    if (amendNeedsValidation) {
+      await refreshActivatedRepository();
+      await loadPreflight();
+      return;
+    }
     if (session && !demo) {
       try {
         session = await realAdapter.repoSnapshot(session.repoId, true);
@@ -2700,6 +2783,7 @@
     void loadSettings();
     restoreWidths();
     void Promise.all([loadHistory(true), loadStatus(), loadRemoteStatus(), loadIdentity()]);
+    if (amendNeedsValidation) void refreshActivatedRepository(false);
     void subscribeInvalidated();
   });
   onDestroy(() => {
@@ -2722,7 +2806,7 @@
     if (!session) return;
     const next: WorkspaceState = {
       snapshot: session,
-      busy: busy || indexBusy || discardBusy || commitBusy || branchBusy || syncJobActive || mergeBusy || conflictBusy !== null || stashSaveBusy || stashBusyEntry !== null,
+      busy: busy || indexBusy || discardBusy || commitBusy || amendLoading || branchBusy || syncJobActive || mergeBusy || conflictBusy !== null || stashSaveBusy || stashBusyEntry !== null,
       hasDraft: !!(shell.commitMessage.trim() || commitBody.trim()),
       changedFiles: statusFiles?.length ?? null,
       hasError: !!(sessionError || indexError || commitError || syncError || conflictActionError),
@@ -3019,7 +3103,7 @@
         {statusLoading}
         {statusError}
         trustBlocked={session.trust === "readOnly"}
-        onRefreshStatus={() => void loadStatus()}
+        onRefreshStatus={() => void (amendNeedsValidation ? refreshActivatedRepository() : loadStatus())}
         selectedDiffTarget={diff.selection?.target ?? null}
         onWorktreeDiff={loadWorktreeDiff}
         onCommitDiff={loadCommitDiff}
@@ -3032,6 +3116,11 @@
         {commitBody}
         {commitBusy}
         {commitError}
+        {amendOid}
+        {amendLoading}
+        {amendUnavailable}
+        {amendStale}
+        onAmend={(enabled) => void toggleAmend(enabled)}
         {identityLabel}
         headDetached={session.head.kind === "detached"}
         onCommitBody={(value) => (commitBody = value)}
@@ -3132,18 +3221,23 @@
     />
   {/if}
   {#if active && historyAction && session}
+    {#key historyAction}
     <CommitActionModal
       action={historyAction.action}
       oid={historyAction.row.oid}
       subject={historyAction.row.subject}
       isHead={historyActionHead(historyAction.row.oid)}
       busy={historyActionBusy}
+      initialValues={historyMessage}
+      loading={historyAction.action === "reword" && historyActionBusy && !historyMessage}
+      ready={historyAction.action !== "reword" || historyMessage !== null}
       error={historyActionError}
       confirmSummary={historyConfirmSummary}
       planRows={historyPlanRows}
       onSubmit={(values, plan) => void submitHistoryAction(values, plan)}
       onClose={closeHistoryAction}
     />
+    {/key}
   {/if}
   {#if active && stashSwitch && session}
     <StashSwitchModal

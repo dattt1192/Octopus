@@ -10,18 +10,21 @@
 
   let { branchName, files, loading, error, trustBlocked, selectedTarget, indexBusy, indexError,
     subject, body, commitBusy, commitError, identityLabel, headDetached, onRefresh, onOpen,
+    amendOid, amendLoading, amendUnavailable, amendStale, onAmend,
     onStage, onUnstage, onDiscard, onDiscardAll, onSubject, onBody, onCommit, onConflicts }: {
     branchName: string; files: ChangedFile[] | null; loading: boolean; error: AppError | null; trustBlocked: boolean;
     selectedTarget: DiffTarget | null; indexBusy: boolean; indexError: AppError | null;
     subject: string; body: string; commitBusy: boolean; commitError: AppError | null; identityLabel: string | null; headDetached: boolean;
+    amendOid: string | null; amendLoading: boolean; amendUnavailable: string | null; amendStale: boolean;
+    onAmend: (enabled: boolean) => void;
     onRefresh: () => void; onOpen: (id: string, side: FileSide, path: string) => void;
     onStage: (ids: string[]) => void; onUnstage: (ids: string[]) => void; onDiscard: (id: string) => void; onDiscardAll: () => void; onSubject: (value: string) => void; onBody: (value: string) => void; onCommit: () => void; onConflicts: () => void;
   } = $props();
   const changes = $derived(partitionStatus((files ?? []).filter(f => !f.conflicted)));
   const conflicts = $derived((files ?? []).filter(f => f.conflicted));
   const disabled = $derived(trustBlocked || indexBusy || commitBusy || loading || files === null);
-  const commitHint = $derived(trustBlocked ? "Trust this repository to commit." : conflicts.length ? "Resolve conflicts before committing." : files === null ? "Load working changes first." : changes.staged.length === 0 ? "Stage a file to include it in your commit." : !subject.trim() ? "Write a summary for this commit." : `${changes.staged.length} staged ${changes.staged.length === 1 ? "file" : "files"} will be committed.`);
-  const canCommit = $derived(!disabled && !conflicts.length && changes.staged.length > 0 && subject.trim() !== "");
+  const commitHint = $derived(trustBlocked ? "Trust this repository to commit." : conflicts.length ? "Resolve conflicts before committing." : files === null ? "Load working changes first." : amendStale ? "HEAD changed or is not verified. Refresh or turn Amend off before continuing." : changes.staged.length === 0 && !amendOid ? "Stage a file to include it in your commit." : !subject.trim() ? "Write a summary for this commit." : amendOid ? `Replace commit ${amendOid.slice(0, 7)} with this message and the staged changes.` : `${changes.staged.length} staged ${changes.staged.length === 1 ? "file" : "files"} will be committed.`);
+  const canCommit = $derived(!disabled && !amendLoading && !amendStale && !error && !conflicts.length && (changes.staged.length > 0 || amendOid !== null) && subject.trim() !== "");
   let fileMenu = $state<{ file: ChangedFile; side: FileSide; x: number; y: number } | null>(null);
   function commitKey(event: KeyboardEvent) {
     if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
@@ -137,15 +140,28 @@
   {#if headDetached}<p class="gd-notice">Detached HEAD. Create a branch to keep your next commit reachable.</p>{/if}
 </div>
 <footer class="gd-commit-editor">
-  <div class="gd-editor-heading"><h3>Create commit</h3><span>Staged files only</span></div>
+  <div class="gd-editor-heading"><h3>{amendOid ? "Amend commit" : "Create commit"}</h3><span>Staged files only</span></div>
+  <label class="gd-amend-toggle" title={amendUnavailable ?? "Replace the latest commit with your staged changes and message"}>
+    <input type="checkbox" checked={amendOid !== null} disabled={disabled || amendLoading || (!amendOid && (!!amendUnavailable || !!conflicts.length))} onchange={e => {
+      const enabled = e.currentTarget.checked;
+      // The mode changes only after HEAD loads successfully.
+      e.currentTarget.checked = amendOid !== null;
+      onAmend(enabled);
+    }} />
+    Amend last commit
+  </label>
+  {#if amendLoading}<p class="gd-commit-hint" role="status">Loading last commit…</p>
+  {:else if amendOid}<p class="gd-amend-notice" role="status">{#if amendStale}HEAD changed or is not verified. Refresh or turn Amend off before continuing.{:else}Replaces <code>{amendOid.slice(0, 7)}</code> and rewrites its history. Only amend commits you have not shared.{/if}</p>
+  {:else if amendUnavailable}<p class="gd-commit-hint">{amendUnavailable}</p>{/if}
   <label for={summaryId}>Summary</label>
-  <input id={summaryId} aria-label="Commit subject" placeholder="What changed?" value={subject} maxlength="500" oninput={e => onSubject(e.currentTarget.value)} onkeydown={commitKey} />
+  <input id={summaryId} aria-label="Commit subject" placeholder="What changed?" value={subject} maxlength="500" disabled={commitBusy || amendLoading} oninput={e => onSubject(e.currentTarget.value)} onkeydown={commitKey} />
   <details open={body !== ""}><summary>Add description <span>optional</span></summary>
-    <textarea aria-label="Commit body" placeholder="Why was this change needed?" value={body} rows="3" oninput={e => onBody(e.currentTarget.value)} onkeydown={commitKey}></textarea>
+    <textarea aria-label="Commit body" placeholder="Why was this change needed?" value={body} rows="3" disabled={commitBusy || amendLoading} oninput={e => onBody(e.currentTarget.value)} onkeydown={commitKey}></textarea>
   </details>
-  {#if identityLabel}<p class="gd-identity" title={identityLabel}>{identityLabel}</p>{/if}
+  {#if amendOid}<p class="gd-identity">Original author is preserved.</p>
+  {:else if identityLabel}<p class="gd-identity" title={identityLabel}>{identityLabel}</p>{/if}
   {#if commitError}<p class="gd-error" role="alert">{commitError.message} Your draft is saved.</p>{/if}
-  <button class="gd-commit-button" disabled={!canCommit} title={commitHint} onclick={onCommit}>{commitBusy ? "Committing…" : `Commit ${changes.staged.length} ${changes.staged.length === 1 ? "file" : "files"}`}<span>⌃ ↵</span></button>
+  <button class="gd-commit-button" disabled={!canCommit} title={commitHint} onclick={onCommit}>{commitBusy ? (amendOid ? "Amending…" : "Committing…") : amendOid ? "Amend last commit" : `Commit ${changes.staged.length} ${changes.staged.length === 1 ? "file" : "files"}`}<span>⌃ ↵</span></button>
 </footer>
 {#if fileMenu}<ContextMenu x={fileMenu.x} y={fileMenu.y} items={fileMenuItems(fileMenu.file, fileMenu.side)}
   label={`File actions for ${fileMenu.file.displayPath}`} onClose={() => (fileMenu = null)} />{/if}
@@ -182,6 +198,9 @@
   .gd-editor-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
   .gd-editor-heading>span, .gd-commit-hint { color: var(--gd-text-secondary); font-size: 10px; }
   label { display: block; color: var(--gd-text-secondary); font-size: 11px; margin-bottom: 6px; }
+  .gd-amend-toggle { display: flex; align-items: center; gap: 7px; margin-bottom: 10px; color: var(--gd-text); cursor: pointer; }
+  .gd-amend-toggle input { width: auto; margin: 0; accent-color: var(--gd-accent); }
+  .gd-amend-notice { color: var(--gd-warning); font-size: 11px; line-height: 1.4; margin: 0 0 10px; }
   input, textarea { width: 100%; background: var(--gd-canvas); color: var(--gd-text); border: 1px solid var(--gd-border); border-radius: 4px; padding: 7px 8px; font: var(--gd-font-size-small)/1.4 var(--gd-font-ui); }
   textarea { resize: vertical; min-height: 64px; max-height: 140px; margin-top: 8px; }
   details { margin-top: 10px; font-size: 11px; color: var(--gd-text-secondary); }

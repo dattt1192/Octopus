@@ -18,6 +18,9 @@
     subject: string;
     isHead: boolean;
     busy: boolean;
+    initialValues?: Record<string, string> | null;
+    loading?: boolean;
+    ready?: boolean;
     error: AppError | string | null;
     confirmSummary: string | null;
     planRows: PlanRow[];
@@ -26,7 +29,7 @@
     onClose: () => void;
   }
 
-  let { action, oid, subject, isHead, busy, error, confirmSummary, planRows, formOverride = null, onSubmit, onClose }: Props = $props();
+  let { action, oid, subject, isHead, busy, initialValues = null, loading = false, ready = true, error, confirmSummary, planRows, formOverride = null, onSubmit, onClose }: Props = $props();
 
   const form: CommitActionForm | BranchFormOverride = $derived(
     formOverride ?? COMMIT_ACTION_FORMS[action as CommitActionId]
@@ -37,6 +40,14 @@
   let planMessages: Record<string, string> = $state({});
   let typeConfirm = $state("");
   let localError: string | null = $state(null);
+  let initialized = $state(false);
+
+  $effect(() => {
+    if (!initialized && initialValues) {
+      values = { ...values, ...initialValues };
+      initialized = true;
+    }
+  });
 
   function keyDown(e: KeyboardEvent): void {
     if (e.key === "Escape") onClose();
@@ -55,6 +66,7 @@
   }
 
   function submit(): void {
+    if (busy || !ready) return;
     localError = null;
     if (form.typeToConfirm && typeConfirm.trim() !== shortOid) {
       localError = `Type ${shortOid} to confirm.`;
@@ -107,6 +119,7 @@
       {#if !isHead && !form.headOnly} · target selected row{/if}
     </p>
     <p class="gd-muted">{form.description}</p>
+    {#if loading}<p role="status">Loading commit message…</p>{/if}
 
     {#if error}
       <p class="gd-error" role="alert">{errorText(error)}</p>
@@ -128,7 +141,7 @@
               aria-label={`Action for ${row.oid.slice(0, 7)}`}
               value={actionFor(row.oid)}
               onchange={(e) => (planActions = { ...planActions, [row.oid]: e.currentTarget.value })}
-              disabled={busy}
+              disabled={busy || !ready}
             >
               <option value="pick">pick</option>
               <option value="reword">reword</option>
@@ -143,7 +156,7 @@
                 placeholder="New message"
                 value={planMessages[row.oid] ?? ""}
                 oninput={(e) => (planMessages = { ...planMessages, [row.oid]: e.currentTarget.value })}
-                disabled={busy}
+                disabled={busy || !ready}
               />
             {/if}
           </li>
@@ -158,7 +171,7 @@
               value={values[field.key] ?? ""}
               placeholder={field.placeholder ?? ""}
               oninput={(e) => (values = { ...values, [field.key]: e.currentTarget.value })}
-              disabled={busy}
+              disabled={busy || !ready}
             ></textarea>
           </label>
         {:else if field.kind === "checkbox"}
@@ -167,7 +180,7 @@
               type="checkbox"
               checked={(values[field.key] ?? "true") === "true"}
               onchange={(e) => (values = { ...values, [field.key]: String(e.currentTarget.checked) })}
-              disabled={busy}
+              disabled={busy || !ready}
             />
             {field.label}
           </label>
@@ -179,7 +192,7 @@
               value={values[field.key] ?? ""}
               placeholder={field.placeholder ?? ""}
               oninput={(e) => (values = { ...values, [field.key]: e.currentTarget.value })}
-              disabled={busy}
+              disabled={busy || !ready}
             />
           </label>
         {:else if field.kind === "select"}
@@ -188,7 +201,7 @@
             <select
               value={values[field.key] ?? ""}
               onchange={(e) => (values = { ...values, [field.key]: e.currentTarget.value })}
-              disabled={busy}
+              disabled={busy || !ready}
             >
               <option value="">Choose…</option>
               {#each field.options as option (option.value)}
@@ -207,7 +220,7 @@
           type="text"
           value={typeConfirm}
           oninput={(e) => (typeConfirm = e.currentTarget.value)}
-          disabled={busy}
+          disabled={busy || !ready}
         />
       </label>
     {/if}
@@ -218,7 +231,7 @@
         type="button"
         class:gd-danger-btn={form.danger}
         onclick={submit}
-        disabled={busy || (form.typeToConfirm && typeConfirm.trim() !== shortOid)}
+        disabled={busy || !ready || (form.typeToConfirm && typeConfirm.trim() !== shortOid)}
       >
         {busy ? "Working…" : form.submitLabel}
       </button>
