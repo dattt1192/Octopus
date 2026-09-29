@@ -24,6 +24,8 @@ Inspect staged and unstaged files in a unified diff with syntax highlighting. St
 
 Search local and remote branches, create branches and tags, and manage upstreams. Context menus provide checkout, merge, rebase, cherry-pick, and revert actions. Fetch, pull, and push are available in the toolbar; the merge workflow also includes conflict inspection and resolution.
 
+The selected repository automatically fetches every five minutes while Octopus is open. Use **Menu → Settings → Auto fetch** to turn it off or choose 1, 5, 10, or 15 minutes, then Save. Auto fetch waits while offline or busy, requires repository trust, and refreshes history and ahead/behind counts without pulling or changing working files.
+
 ![Branch context menu with checkout, merge, rebase, tag, upstream, and push actions](docs/images/branch-actions.png)
 
 ### Stash and restore work

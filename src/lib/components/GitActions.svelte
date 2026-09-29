@@ -8,6 +8,7 @@
     jobActive: boolean;
     /** Kind of the running sync job ("fetch" | "pull" | "push"); its button spins. */
     activeJobKind: string | null;
+    autoFetchMinutes?: number;
     onFetch: () => void;
     onPull: () => void;
     onPush: () => void;
@@ -30,6 +31,7 @@
     syncDisabledReason,
     jobActive,
     activeJobKind,
+    autoFetchMinutes = 0,
     onFetch,
     onPull,
     onPush,
@@ -59,7 +61,7 @@
     type="button"
     class="gd-tool gd-tool-live"
     disabled={syncDisabled || jobActive}
-    title={spinning("fetch") ? "Fetching from the upstream remote…" : syncDisabled ? syncDisabledReason : "Fetch from the upstream remote (background job)"}
+    title={spinning("fetch") ? "Fetching from the upstream remote…" : syncDisabled ? syncDisabledReason : `Fetch from the upstream remote. Auto fetch: ${autoFetchMinutes ? `every ${autoFetchMinutes} min` : "off"} (Settings).`}
     aria-label={spinning("fetch") ? "Fetching" : "Fetch"}
     onclick={onFetch}
   >
