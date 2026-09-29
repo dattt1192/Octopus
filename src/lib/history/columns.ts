@@ -1,7 +1,7 @@
 export type HistoryColumn = "branches" | "graph" | "subject" | "author" | "date";
 export type ColumnWidths = Record<HistoryColumn, number | null>;
 export const COLUMN_LIMITS = {
-  branches: { min: 110, max: 420, initial: 150 },
+  branches: { min: 110, max: 420, initial: 170 },
   graph: { min: 64, max: 1600, initial: 84 },
   subject: { min: 200, max: 1400, initial: 320 },
   author: { min: 100, max: 420, initial: 140 },
@@ -10,7 +10,7 @@ export const COLUMN_LIMITS = {
 export const COLUMNS_KEY = "gitdock.history-columns.v1";
 
 export function defaultColumns(): ColumnWidths {
-  return { branches: 150, graph: 84, subject: null, author: 140, date: 120 };
+  return { branches: 170, graph: 84, subject: null, author: 140, date: 120 };
 }
 
 /**

@@ -10,11 +10,12 @@
 
   import ColumnResize from "./ColumnResize.svelte";
   import { COLUMNS_KEY, COLUMN_LIMITS, clampColumn, defaultColumns, formatCommitDate, restoreColumns, type HistoryColumn } from "../history/columns";
-  import { refItemForBadge, refsByCommit, type RefBadge } from "../history/refs";
+  import { branchTipPlacement, primaryBadge, refItemForBadge, refsByCommit, type RefBadge } from "../history/refs";
+  import RefKindIcon from "./RefKindIcon.svelte";
   import ContextMenu from "./ContextMenu.svelte";
   import { isContextMenuKey, pointFromContextEvent, type ContextMenuItem } from "../context-menu/model";
   import { COMMIT_ACTIONS, type CommitActionId } from "../history/commit-menu";
-  import { buildBranchMenuItems, type BranchMenuAction } from "../refs/branch-menu";
+  import { buildBranchMenuItems, canCheckoutRef, type BranchMenuAction } from "../refs/branch-menu";
 
   export interface ScopeOption {
     value: string;
@@ -57,6 +58,9 @@
     onLoadMore: () => void;
     /** Same lock as the sidebar branch menu. */
     branchActionsDisabled: boolean;
+    /** Merge target label for the badge menu; null disables merge. */
+    mergeTarget?: string | null;
+    mergeBusy?: boolean;
     /** When set, right-clicking a branch badge opens the branch menu. */
     onBranchAction?: (action: BranchMenuAction, ref: RefItem) => void;
     /** Working-changes summary pinned under the header; null hides the bar. */
@@ -98,6 +102,8 @@
     onLoadMore,
     branchActionsDisabled,
     onBranchAction,
+    mergeTarget = null,
+    mergeBusy = false,
     workBar = null,
     onOpenWorkingChanges
   }: Props = $props();
@@ -117,6 +123,7 @@
   let focusOid: string | null = $state(null);
   let rowMenu = $state<{ row: CommitRow; x: number; y: number } | null>(null);
   let badgeMenu = $state<{ ref: RefItem; x: number; y: number } | null>(null);
+  let branchTip = $state<{ x: number; y: number; above: boolean; badges: RefBadge[] } | null>(null);
 
   const laidByOid = $derived(new Map(laid.map((r) => [r.oid, r])));
   const window = $derived(windowRows(activeRows(), scrollTop, Math.max(0, viewportHeight - headerHeight), rowHeight, overscan));
@@ -124,13 +131,14 @@
   // The column is a viewport, not a minimum imposed by the repository's lane count.
   const graphWidth = $derived(columns.graph ?? 84);
   const graphContentWidth = $derived(Math.max(graphWidth, laneCount * laneWidth + 16));
-  const branchWidth = $derived(columns.branches ?? 150);
+  const branchWidth = $derived(columns.branches ?? 170);
   const authorWidth = $derived(columns.author ?? 140);
   const dateWidth = $derived(columns.date ?? 120);
   const subjectWidth = $derived(columns.subject ?? Math.max(200, viewportWidth - authorWidth - (searchActive ? 110 : graphWidth + branchWidth + dateWidth)));
   const tableWidth = $derived(subjectWidth + authorWidth + (searchActive ? 110 : graphWidth + branchWidth + dateWidth));
   const columnTemplate = $derived(`${searchActive ? "" : `${branchWidth}px ${graphWidth}px `}${subjectWidth}px ${authorWidth}px${searchActive ? " 110px" : ` ${dateWidth}px`}`);
   const badgesByOid = $derived(refsByCommit(refs));
+  const refById = $derived(new Map(refs.map((ref) => [ref.refId, ref])));
   const headerColumns = $derived((searchActive ? ["subject", "author"] : ["branches", "graph", "subject", "author", "date"]) as HistoryColumn[]);
   const labels = { branches: "Branch", graph: "Graph", subject: "Subject", author: "Author", date: "Date" };
 
@@ -156,7 +164,8 @@
       id, name: refLabels.get(id) ?? id.replace(/^refs\/(heads|remotes|tags)\//, ""),
       source: id.startsWith("refs/remotes/") ? "remote" : id.startsWith("refs/tags/") ? "tag" : "local",
       kind: id.startsWith("refs/remotes/") ? "remote" : id.startsWith("refs/tags/") ? "tag" : "local",
-      fullName: id
+      fullName: id,
+      current: refById.get(id)?.current ?? false
     }));
   }
 
@@ -188,6 +197,7 @@
   function onScroll(e: Event): void {
     rowMenu = null;
     badgeMenu = null;
+    hideBranchTip();
     const el = e.currentTarget as HTMLElement;
     scrollTop = el.scrollTop;
     viewportHeight = el.clientHeight;
@@ -207,9 +217,66 @@
     event.preventDefault();
     event.stopPropagation();
     badgeMenu = null;
+    hideBranchTip();
     focusOid = row.oid;
     const point = pointFromContextEvent(event);
     rowMenu = { row, x:point.left, y:point.top };
+  }
+
+  let tipEl: HTMLDivElement | undefined = $state(undefined);
+  let tipTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function showBranchTip(event: MouseEvent | FocusEvent, badges: RefBadge[]): void {
+    if (badges.length < 2) return;
+    if (tipTimer !== null) {
+      clearTimeout(tipTimer);
+      tipTimer = null;
+    }
+    const el = event.currentTarget as HTMLElement;
+    const rect = el.getBoundingClientRect();
+    const at = branchTipPlacement(
+      { left: rect.left, top: rect.top, bottom: rect.bottom },
+      document.documentElement.clientWidth,
+      document.documentElement.clientHeight
+    );
+    branchTip = { ...at, badges };
+  }
+
+  function hideBranchTip(): void {
+    if (tipTimer !== null) {
+      clearTimeout(tipTimer);
+      tipTimer = null;
+    }
+    branchTip = null;
+  }
+
+  /** Grace period for moving the pointer or focus from the badge into the panel. */
+  function scheduleHideBranchTip(): void {
+    if (tipTimer !== null) clearTimeout(tipTimer);
+    tipTimer = setTimeout(() => {
+      branchTip = null;
+      tipTimer = null;
+    }, 250);
+  }
+
+  function cancelHideBranchTip(): void {
+    if (tipTimer !== null) {
+      clearTimeout(tipTimer);
+      tipTimer = null;
+    }
+  }
+
+  function tipFocusOut(event: FocusEvent): void {
+    const to = event.relatedTarget;
+    if (to instanceof Node && tipEl?.contains(to)) return;
+    hideBranchTip();
+  }
+
+  function doubleClickBadge(badge: RefBadge): void {
+    if (branchActionsDisabled || !onBranchAction) return;
+    const ref = refItemForBadge(refs, badge);
+    if (!ref || ref.current || !canCheckoutRef(ref)) return;
+    onBranchAction("checkout", ref);
   }
 
   function openBadgeMenu(event: MouseEvent, badge: RefBadge): void {
@@ -226,7 +293,7 @@
   function badgeMenuItems(ref: RefItem): ContextMenuItem[] {
     return buildBranchMenuItems(
       ref,
-      { actionsDisabled: branchActionsDisabled, selectedCommitOid: selectedOid },
+      { actionsDisabled: branchActionsDisabled, selectedCommitOid: selectedOid, mergeTarget, mergeBusy },
       (action, target) => onBranchAction?.(action, target),
       (text) => {
         void navigator.clipboard.writeText(text);
@@ -405,7 +472,7 @@
         <span class="gd-workbar-go" aria-hidden="true">→</span>
       </button>
     {/if}
-  {#if searchActive ? searchLoading && searchRows.length === 0 : loading}
+  {#if searchActive ? searchLoading && searchRows.length === 0 : loading && rows.length === 0}
     <p class="gd-state" role="status">{searchActive ? "Searching…" : "Loading history…"}</p>
   {:else if searchActive ? searchError : error}
     {@const failure = searchActive ? searchError : error}
@@ -420,6 +487,7 @@
       {#each visible as row, i (row.oid)}
         {@const laidRow = laidByOid.get(row.oid)}
         {@const badges = badgesFor(row)}
+        {@const primary = primaryBadge(badges)}
         <div class="gd-list-row" class:contexted={rowMenu?.row.oid === row.oid} role="listitem"
           aria-setsize={activeRows().length} aria-posinset={window.start + i + 1}
           oncontextmenu={(event) => openRowMenu(event, row)} onkeydown={(event) => rowMenuKey(event, row)}>
@@ -428,14 +496,34 @@
             onclick={() => { focusOid = row.oid; onSelect(row.oid); }}
             aria-label={`${row.subject}, ${row.authorName}, ${row.parents.length} parent${row.parents.length === 1 ? "" : "s"}`}>
             {#if !searchActive}
-              <span class="gd-branches" title={badges.map(b => b.fullName).join("\n")}>
-                {#each badges.slice(0, 2) as badge (badge.id)}
-                  <span class="gd-ref-badge" class:remote={badge.kind === "remote"} class:tag={badge.kind === "tag"}
-                    oncontextmenu={(event) => openBadgeMenu(event, badge)}>
-                    <span class="gd-ref-source">{badge.source}</span><span class="gd-ref-name">{badge.name}</span>
-                    {#if badge === badges[0] && badges.length > 2}<span class="gd-ref-extra">+{badges.length - 2}</span>{/if}
+              <span class="gd-branches">
+                {#if primary}
+                  <span
+                    class="gd-ref-badge"
+                    class:remote={primary.kind === "remote"}
+                    class:tag={primary.kind === "tag"}
+                    class:current={primary.current}
+                    tabindex="0"
+                    role="button"
+                    aria-label={`${primary.source} ${primary.name}`}
+                    oncontextmenu={(event) => openBadgeMenu(event, primary)}
+                    ondblclick={() => doubleClickBadge(primary)}
+                    onmouseenter={(event) => showBranchTip(event, badges)}
+                    onmouseleave={scheduleHideBranchTip}
+                    onfocus={(event) => showBranchTip(event, badges)}
+                    onblur={scheduleHideBranchTip}
+                    onkeydown={(event) => {
+                      if (event.key === "Escape") hideBranchTip();
+                      else if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        doubleClickBadge(primary);
+                      }
+                    }}
+                  >
+                    <span class="gd-ref-source"><RefKindIcon kind={primary.kind} /></span><span class="gd-ref-name">{primary.name}</span>
                   </span>
-                {/each}
+                {/if}
+                {#if badges.length > 1}<span class="gd-ref-extra">+{badges.length - 1}</span>{/if}
               </span>
             <span class="gd-graph-clip">
             <svg
@@ -499,6 +587,42 @@
     label={`Commit actions for ${shortOid(rowMenu.row.oid)}`} onClose={() => (rowMenu = null)} />{/if}
   {#if badgeMenu}<ContextMenu x={badgeMenu.x} y={badgeMenu.y} items={badgeMenuItems(badgeMenu.ref)}
     label={`Branch actions for ${badgeMenu.ref.label}`} onClose={() => (badgeMenu = null)} />{/if}
+  {#if branchTip}
+    <div
+      class="gd-branch-tip"
+      class:above={branchTip.above}
+      style={`left: ${branchTip.x}px; top: ${branchTip.y}px`}
+      role="menu"
+      aria-label="Branches on this commit"
+      tabindex="-1"
+      bind:this={tipEl}
+      onmouseenter={cancelHideBranchTip}
+      onmouseleave={hideBranchTip}
+      onfocusin={cancelHideBranchTip}
+      onfocusout={tipFocusOut}
+      onkeydown={(event) => { if (event.key === "Escape") hideBranchTip(); }}
+    >
+      {#each branchTip.badges as badge (badge.id)}
+        {@const tipRef = refItemForBadge(refs, badge)}
+        {@const tipDisabled = tipRef === null || tipRef.current || branchActionsDisabled || !canCheckoutRef(tipRef)}
+        <button
+          type="button"
+          role="menuitem"
+          class="gd-tip-branch"
+          class:remote={badge.kind === "remote"}
+          class:tag={badge.kind === "tag"}
+          disabled={tipDisabled}
+          title={tipRef?.current ? "Already checked out" : badge.kind === "tag" ? "Tags cannot be checked out" : `Check out ${badge.name}`}
+          onclick={() => {
+            hideBranchTip();
+            doubleClickBadge(badge);
+          }}
+        >
+          <RefKindIcon kind={badge.kind} /><span class="gd-tip-name">{badge.kind === "remote" ? `${badge.source}/${badge.name}` : badge.name}</span>{#if tipRef?.current}<span class="gd-tip-current" aria-label="current">•</span>{/if}
+        </button>
+      {/each}
+    </div>
+  {/if}
 </section>
 
 <style>
@@ -553,13 +677,25 @@
   .gd-commit-row:hover { background: var(--gd-surface-hover); }
   .gd-commit-row.selected { background: var(--gd-surface-selected); }
   .gd-commit-row.focused, button:focus-visible, .gd-viewport:focus-visible, select:focus-visible { outline: 2px solid var(--gd-focus); outline-offset: -2px; }
-  .gd-branches { display: flex; flex-direction: column; justify-content: center; gap: 1px; height: 28px; min-width: 0; padding: 1px 8px; }
-  .gd-ref-badge { display: flex; align-items: center; gap: 5px; min-width: 0; color: var(--gd-accent); font-size: 11px; line-height: 14px; }
-  .gd-ref-badge.remote { color: var(--gd-lane-2); }
-  .gd-ref-badge.tag { color: var(--gd-warning); }
-  .gd-ref-source { opacity: .8; font-size: 10px; border-left: 2px solid currentColor; padding-left: 4px; }
+  .gd-branches { display: flex; flex-direction: row; align-items: center; gap: 4px; height: 28px; min-width: 0; padding: 1px 8px; }
+  .gd-ref-badge { display: inline-flex; align-items: center; gap: 4px; flex: 0 1 auto; min-width: 0; max-width: 100%; border: 1px solid var(--gd-accent); border-radius: var(--gd-radius-control); background: transparent; color: var(--gd-accent); font-size: 11px; line-height: 1; padding: 3px 6px; white-space: nowrap; }
+  .gd-ref-badge.remote { border-color: var(--gd-lane-2); color: var(--gd-lane-2); }
+  .gd-ref-badge.tag { border-color: var(--gd-warning); color: var(--gd-warning); }
+  .gd-ref-badge.current { flex-shrink: 0; background: var(--gd-accent); border-color: var(--gd-accent); color: var(--gd-on-accent); }
+  .gd-ref-source { display: inline-flex; }
   .gd-ref-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
-  .gd-ref-extra { color: var(--gd-text-secondary); margin-left: auto; }
+  .gd-ref-badge:focus-visible { outline: 2px solid var(--gd-focus); outline-offset: 1px; }
+  .gd-ref-extra { border: 1px solid var(--gd-border); border-radius: var(--gd-radius-control); color: var(--gd-text-secondary); font-size: 10px; line-height: 1; padding: 3px 6px; white-space: nowrap; cursor: default; }
+  .gd-branch-tip { position: fixed; z-index: 60; display: flex; flex-direction: column; align-items: stretch; gap: 2px; min-width: 160px; max-width: 280px; max-height: 200px; overflow-y: auto; background: var(--gd-surface-raised); border: 1px solid var(--gd-border); border-radius: var(--gd-radius-control); padding: 4px; }
+  .gd-branch-tip.above { transform: translateY(-100%); }
+  .gd-tip-branch { display: flex; align-items: center; gap: 6px; width: 100%; background: transparent; border: 0; border-radius: var(--gd-radius-control); color: var(--gd-accent); font: inherit; font-size: 11px; padding: 4px 6px; cursor: pointer; text-align: left; }
+  .gd-tip-branch.remote { color: var(--gd-lane-2); }
+  .gd-tip-branch.tag { color: var(--gd-warning); }
+  .gd-tip-branch:hover:not(:disabled) { background: var(--gd-surface-hover); }
+  .gd-tip-branch:disabled { cursor: default; opacity: .55; }
+  .gd-tip-branch:focus-visible { outline: 2px solid var(--gd-focus); outline-offset: -2px; }
+  .gd-tip-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .gd-tip-current { flex: 0 0 auto; }
   .gd-graph { display: block; }
   .gd-graph-clip { display: block; min-width: 0; height: 28px; overflow: hidden; }
   .gd-subject { min-width: 0; padding: 0 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
