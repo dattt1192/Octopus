@@ -9,9 +9,10 @@ use tauri::State;
 use tokio::sync::Mutex;
 
 use crate::domain::{
-    ApiResult, AppError, CommitResult, ErrorCode, IdentityInfo, RecoveryAction, RequestId,
-    TrustState,
+    ApiResult, AppError, CommitResult, ErrorCode, HeadState, IdentityInfo, RecoveryAction,
+    RepoState, RequestId, TrustState,
 };
+use crate::git::commit::amend_staged;
 use crate::git::{
     commit_staged, has_unmerged, index_is_empty, read_identity, CommitError, GitRunner,
 };
@@ -151,6 +152,7 @@ async fn core_commit(
     expected_version: u64,
     subject: &str,
     body: &str,
+    amend_oid: Option<&str>,
 ) -> Result<CommitResult, AppError> {
     let session = registry.get(repo_id).ok_or_else(session_missing)?.clone();
     if session.trust != TrustState::Trusted {
@@ -169,6 +171,20 @@ async fn core_commit(
     if body.len() > MAX_BODY_BYTES {
         return Err(bad_request("Commit body exceeds 64 KiB"));
     }
+    if let Some(oid) = amend_oid {
+        let oid_len = if session.object_format == "sha256" {
+            64
+        } else {
+            40
+        };
+        if oid.len() != oid_len || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(bad_request("Amend requires the full HEAD commit ID"));
+        }
+    }
+
+    let queue = registry.queue_for(&session.key());
+    let _guard = queue.lock().await;
+
     if has_unmerged(runner, &session.worktree_root)
         .await
         .map_err(commit_error)?
@@ -180,9 +196,10 @@ async fn core_commit(
             false,
         ));
     }
-    if index_is_empty(runner, &session.worktree_root)
-        .await
-        .map_err(commit_error)?
+    if amend_oid.is_none()
+        && index_is_empty(runner, &session.worktree_root)
+            .await
+            .map_err(commit_error)?
     {
         return Err(AppError::new(
             ErrorCode::EMPTY_INDEX,
@@ -205,9 +222,6 @@ async fn core_commit(
         ));
     }
 
-    let queue = registry.queue_for(&session.key());
-    let _guard = queue.lock().await;
-
     // 72 chars is a soft guideline, never a hard reject (engine §4).
     let mut message = String::with_capacity(subject.len() + body.len() + 4);
     message.push_str(subject);
@@ -217,9 +231,38 @@ async fn core_commit(
         message.push_str(body);
     }
     message.push('\n');
-    let oid = commit_staged(runner, &session.worktree_root, message.as_bytes())
-        .await
-        .map_err(commit_error)?;
+    let oid = if let Some(expected_oid) = amend_oid {
+        // Read live Git state under the common-directory queue immediately
+        // before writing. A refreshed UI must never retarget an old draft.
+        if registry.state_of(repo_id) != RepoState::Normal
+            || [
+                "MERGE_HEAD",
+                "CHERRY_PICK_HEAD",
+                "REVERT_HEAD",
+                "rebase-merge",
+                "rebase-apply",
+                "sequencer",
+            ]
+            .iter()
+            .any(|marker| session.git_dir.join(marker).exists())
+        {
+            return Err(AppError::new(
+                ErrorCode::CONFLICTS_PRESENT,
+                "Finish or abort the current Git operation before amending",
+                RecoveryAction::InspectState,
+                false,
+            ));
+        }
+        match super::repos::read_head(runner, &session).await? {
+            HeadState::Branch { oid, .. } | HeadState::Detached { oid } if oid == expected_oid => {}
+            HeadState::Unborn { .. } => return Err(bad_request("There is no commit to amend yet")),
+            _ => return Err(stale_state()),
+        }
+        amend_staged(runner, &session.worktree_root, message.as_bytes()).await
+    } else {
+        commit_staged(runner, &session.worktree_root, message.as_bytes()).await
+    }
+    .map_err(commit_error)?;
     registry.bump(repo_id).ok_or_else(session_missing)?;
     let session = registry.get(repo_id).ok_or_else(session_missing)?.clone();
     let snapshot = super::repos::build_snapshot(runner, registry, &session).await?;
@@ -245,6 +288,9 @@ pub struct CommitCreateRequest {
     pub subject: String,
     #[serde(default)]
     pub body: String,
+    /// None creates a commit; Some binds an amend to this exact HEAD.
+    #[serde(default)]
+    pub amend_oid: Option<String>,
 }
 
 #[tauri::command]
@@ -283,6 +329,7 @@ pub async fn commit_create(
             request.expected_version,
             &request.subject,
             &request.body,
+            request.amend_oid.as_deref(),
         )
         .await
     }
@@ -373,9 +420,17 @@ pub(crate) mod tests {
         let repo_id = open_repo(&mut registry, &repo, TrustState::Trusted);
         let version = registry.get(&repo_id).expect("session").version;
 
-        let result = core_commit(&runner, &mut registry, &repo_id, version, "Daily work", "")
-            .await
-            .expect("commit");
+        let result = core_commit(
+            &runner,
+            &mut registry,
+            &repo_id,
+            version,
+            "Daily work",
+            "",
+            None,
+        )
+        .await
+        .expect("commit");
         assert_eq!(result.oid.len(), 40);
         // The new commit is visible in history; the unstaged file survived.
         let tips = vec![result.oid.clone()];
@@ -405,7 +460,7 @@ pub(crate) mod tests {
         let repo_id = open_repo(&mut registry, &repo, TrustState::Trusted);
         let version = registry.get(&repo_id).expect("session").version;
 
-        let empty = core_commit(&runner, &mut registry, &repo_id, version, "   ", "").await;
+        let empty = core_commit(&runner, &mut registry, &repo_id, version, "   ", "", None).await;
         assert!(matches!(
             empty,
             Err(ref e) if e.code == ErrorCode::INVALID_ARGUMENT
@@ -418,6 +473,7 @@ pub(crate) mod tests {
             version,
             "First commit",
             "body text",
+            None,
         )
         .await
         .expect("first commit");
@@ -444,7 +500,7 @@ pub(crate) mod tests {
         std::fs::write(repo.join("a.txt"), "a\n").expect("write");
         git(&repo, &["add", "a.txt"]);
         blank_identity(&repo);
-        let missing = core_commit(&runner, &mut registry, &repo_id, version, "x", "").await;
+        let missing = core_commit(&runner, &mut registry, &repo_id, version, "x", "", None).await;
         assert!(matches!(
             missing,
             Err(ref e) if e.code == ErrorCode::IDENTITY_MISSING
@@ -453,7 +509,7 @@ pub(crate) mod tests {
         with_identity(&repo);
         // Identity fixed, index emptied again: the other guard fires.
         git(&repo, &["rm", "--cached", "a.txt"]);
-        let empty = core_commit(&runner, &mut registry, &repo_id, version, "x", "").await;
+        let empty = core_commit(&runner, &mut registry, &repo_id, version, "x", "", None).await;
         assert!(matches!(
             empty,
             Err(ref e) if e.code == ErrorCode::EMPTY_INDEX
@@ -489,7 +545,7 @@ pub(crate) mod tests {
         let repo_id = open_repo(&mut registry, &repo, TrustState::Trusted);
         let version = registry.get(&repo_id).expect("session").version;
 
-        let failed = core_commit(&runner, &mut registry, &repo_id, version, "try", "").await;
+        let failed = core_commit(&runner, &mut registry, &repo_id, version, "try", "", None).await;
         assert!(matches!(
             failed,
             Err(ref e) if e.code == ErrorCode::HOOK_FAILED
@@ -530,9 +586,306 @@ pub(crate) mod tests {
             version,
             "detached work",
             "",
+            None,
         )
         .await
         .expect("detached commit");
         assert_eq!(result.oid.len(), 40);
+    }
+
+    fn git_text(repo: &std::path::Path, args: &[&str]) -> String {
+        let output = StdCommand::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim_end()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn amend_replaces_head_with_only_index_and_preserves_author_and_parents() {
+        let (_dir, repo) = temp_repo("amend-index");
+        with_identity(&repo);
+        git(&repo, &["commit", "--allow-empty", "-m", "parent"]);
+        std::fs::write(repo.join("file.txt"), "original\n").unwrap();
+        git(&repo, &["add", "file.txt"]);
+        git(&repo, &["commit", "-m", "original"]);
+        let old_oid = git_text(&repo, &["rev-parse", "HEAD"]);
+        let old_metadata = git_text(&repo, &["show", "-s", "--format=%P%n%an%n%ae%n%aI", "HEAD"]);
+        std::fs::write(repo.join("file.txt"), "staged\n").unwrap();
+        git(&repo, &["add", "file.txt"]);
+        std::fs::write(repo.join("file.txt"), "unstaged\n").unwrap();
+        std::fs::write(repo.join("untracked.txt"), "keep\n").unwrap();
+        let runner = git_runner().unwrap();
+        let mut registry = RepoRegistry::default();
+        let id = open_repo(&mut registry, &repo, TrustState::Trusted);
+        let version = registry.get(&id).unwrap().version;
+        let result = core_commit(
+            &runner,
+            &mut registry,
+            &id,
+            version,
+            "Amended",
+            "New body",
+            Some(&old_oid),
+        )
+        .await
+        .unwrap();
+        assert_ne!(result.oid, old_oid);
+        assert_eq!(git_text(&repo, &["rev-list", "--count", "HEAD"]), "2");
+        assert_eq!(
+            git_text(&repo, &["show", "-s", "--format=%P%n%an%n%ae%n%aI", "HEAD"]),
+            old_metadata
+        );
+        assert_eq!(
+            git_text(&repo, &["show", "-s", "--format=%B", "HEAD"]),
+            "Amended\n\nNew body"
+        );
+        assert_eq!(git_text(&repo, &["show", "HEAD:file.txt"]), "staged");
+        assert_eq!(
+            git_text(&repo, &["ls-tree", "--name-only", "HEAD"]),
+            "file.txt"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("file.txt")).unwrap(),
+            "unstaged\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("untracked.txt")).unwrap(),
+            "keep\n"
+        );
+        assert_eq!(result.snapshot.staged_count, Some(0));
+        assert_eq!(result.snapshot.version, version + 1);
+    }
+
+    #[tokio::test]
+    async fn amend_message_only_supports_root_and_detached_head() {
+        for detached in [false, true] {
+            let (_dir, repo) = temp_repo(if detached {
+                "amend-detached"
+            } else {
+                "amend-root"
+            });
+            with_identity(&repo);
+            std::fs::write(repo.join("file.txt"), "original\n").unwrap();
+            git(&repo, &["add", "file.txt"]);
+            git(&repo, &["commit", "-m", "root"]);
+            if detached {
+                git(&repo, &["checkout", "--detach", "HEAD"]);
+            }
+            let old_oid = git_text(&repo, &["rev-parse", "HEAD"]);
+            let tree = git_text(&repo, &["rev-parse", "HEAD^{tree}"]);
+            let runner = git_runner().unwrap();
+            let mut registry = RepoRegistry::default();
+            let id = open_repo(&mut registry, &repo, TrustState::Trusted);
+            let version = registry.get(&id).unwrap().version;
+            let result = core_commit(
+                &runner,
+                &mut registry,
+                &id,
+                version,
+                "New message",
+                "",
+                Some(&old_oid),
+            )
+            .await
+            .unwrap();
+            assert_ne!(result.oid, old_oid);
+            assert_eq!(git_text(&repo, &["rev-list", "--count", "HEAD"]), "1");
+            assert_eq!(git_text(&repo, &["rev-parse", "HEAD^{tree}"]), tree);
+            assert_eq!(
+                matches!(result.snapshot.head, HeadState::Detached { .. }),
+                detached
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn amend_rejects_stale_head_version_untrusted_and_invalid_requests() {
+        let (_dir, repo) = temp_repo("amend-stale");
+        with_identity(&repo);
+        git(&repo, &["commit", "--allow-empty", "-m", "first"]);
+        let old_oid = git_text(&repo, &["rev-parse", "HEAD"]);
+        let runner = git_runner().unwrap();
+        let mut registry = RepoRegistry::default();
+        let id = open_repo(&mut registry, &repo, TrustState::Trusted);
+        let version = registry.get(&id).unwrap().version;
+        // External changes do not bump the registry version.
+        git(&repo, &["commit", "--allow-empty", "-m", "external"]);
+        let live_oid = git_text(&repo, &["rev-parse", "HEAD"]);
+        let cases = [
+            (
+                version,
+                "message",
+                "",
+                old_oid.as_str(),
+                ErrorCode::STALE_STATE,
+            ),
+            (
+                version + 1,
+                "message",
+                "",
+                live_oid.as_str(),
+                ErrorCode::STALE_STATE,
+            ),
+            (
+                version,
+                " ",
+                "",
+                live_oid.as_str(),
+                ErrorCode::INVALID_ARGUMENT,
+            ),
+            (
+                version,
+                "message",
+                "",
+                "--amend",
+                ErrorCode::INVALID_ARGUMENT,
+            ),
+        ];
+        for (version, subject, body, oid, code) in cases {
+            let error = core_commit(
+                &runner,
+                &mut registry,
+                &id,
+                version,
+                subject,
+                body,
+                Some(oid),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(git_text(&repo, &["rev-parse", "HEAD"]), live_oid);
+        }
+        let mut untrusted = RepoRegistry::default();
+        let id = open_repo(&mut untrusted, &repo, TrustState::ReadOnly);
+        let version = untrusted.get(&id).unwrap().version;
+        let error = core_commit(
+            &runner,
+            &mut untrusted,
+            &id,
+            version,
+            "message",
+            "",
+            Some(&live_oid),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::TRUST_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn amend_blocks_unborn_and_in_progress_operations() {
+        let runner = git_runner().unwrap();
+        for marker in [
+            "unborn",
+            "MERGE_HEAD",
+            "CHERRY_PICK_HEAD",
+            "REVERT_HEAD",
+            "rebase-merge",
+            "rebase-apply",
+            "sequencer",
+        ] {
+            let (_dir, repo) = temp_repo(&format!("amend-block-{marker}"));
+            with_identity(&repo);
+            let oid = if marker == "unborn" {
+                "0".repeat(40)
+            } else {
+                git(&repo, &["commit", "--allow-empty", "-m", "first"]);
+                let oid = git_text(&repo, &["rev-parse", "HEAD"]);
+                std::fs::write(repo.join(".git").join(marker), &oid).unwrap();
+                oid
+            };
+            let mut registry = RepoRegistry::default();
+            let id = open_repo(&mut registry, &repo, TrustState::Trusted);
+            let version = registry.get(&id).unwrap().version;
+            let error = core_commit(
+                &runner,
+                &mut registry,
+                &id,
+                version,
+                "message",
+                "",
+                Some(&oid),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.code,
+                if marker == "unborn" {
+                    ErrorCode::INVALID_ARGUMENT
+                } else {
+                    ErrorCode::CONFLICTS_PRESENT
+                }
+            );
+            if marker != "unborn" {
+                assert_eq!(git_text(&repo, &["rev-parse", "HEAD"]), oid);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn amend_signing_failure_preserves_head_and_index() {
+        let (_dir, repo) = temp_repo("amend-signing");
+        with_identity(&repo);
+        git(&repo, &["commit", "--allow-empty", "-m", "first"]);
+        let oid = git_text(&repo, &["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("file.txt"), "staged\n").unwrap();
+        git(&repo, &["add", "file.txt"]);
+        git(&repo, &["config", "commit.gpgsign", "true"]);
+        git(
+            &repo,
+            &["config", "gpg.program", "/nonexistent/octopus-test-gpg"],
+        );
+        let runner = git_runner().unwrap();
+        let mut registry = RepoRegistry::default();
+        let id = open_repo(&mut registry, &repo, TrustState::Trusted);
+        let version = registry.get(&id).unwrap().version;
+        let error = core_commit(
+            &runner,
+            &mut registry,
+            &id,
+            version,
+            "message",
+            "",
+            Some(&oid),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::SIGNING_FAILED);
+        assert_eq!(git_text(&repo, &["rev-parse", "HEAD"]), oid);
+        assert_eq!(
+            git_text(&repo, &["diff", "--cached", "--name-only"]),
+            "file.txt"
+        );
+    }
+
+    #[test]
+    fn commit_request_deserializes_optional_amend_target() {
+        let mut json = serde_json::json!({
+            "requestId": "r", "repoId": "repo", "expectedVersion": 1,
+            "subject": "message", "body": "body"
+        });
+        assert!(serde_json::from_value::<CommitCreateRequest>(json.clone())
+            .unwrap()
+            .amend_oid
+            .is_none());
+        json["amendOid"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<CommitCreateRequest>(json.clone())
+            .unwrap()
+            .amend_oid
+            .is_none());
+        json["amendOid"] = serde_json::Value::String("a".repeat(40));
+        assert_eq!(
+            serde_json::from_value::<CommitCreateRequest>(json)
+                .unwrap()
+                .amend_oid,
+            Some("a".repeat(40))
+        );
     }
 }

@@ -63,6 +63,9 @@ let mockSettings: SettingsV1 = { version: 1, fontScale: 1 };
  */
 export function createMockAdapter(seed: RepoSnapshot = initialDemoSession) {
 const demoSession = structuredClone(seed);
+let commitRows = demoRows();
+const commitBodies = new Map<string, string>();
+const supersededCommits = new Map<string, CommitRow>();
 const mockAdapter = {
   adapter: "mock" as const,
   async appPreflight(_request: AppPreflightRequest): Promise<PreflightData> {
@@ -103,19 +106,48 @@ const mockAdapter = {
     await new Promise((resolve) => setTimeout(resolve, 10));
     return { name: "Demo Author", email: "demo@example.com", scope: "local", signing: false };
   },
-  async commitCreate(repoId: string, _expectedVersion: number, subject: string, _body: string): Promise<CommitResult> {
+  async commitCreate(repoId: string, expectedVersion: number, subject: string, body: string, amendOid: string | null = null): Promise<CommitResult> {
     await new Promise((resolve) => setTimeout(resolve, 30));
     if (subject.trim() === "") {
       const error: AppError = { code: "INVALID_ARGUMENT", message: "Commit subject cannot be empty.", recovery: "inspectState", retryable: false };
       throw error;
     }
     const rows = mockWorktree(repoId);
-    if (!rows.some((f) => ![" ", "?", "!"].includes(f.indexStatus))) {
+    const head = mockSessionWithCounts().head;
+    if (amendOid !== null) {
+      if (head.kind === "unborn") throw { code: "INVALID_ARGUMENT", message: "There is no commit to amend yet.", recovery: "inspectState", retryable: false } satisfies AppError;
+      if (head.oid !== amendOid || expectedVersion !== demoSession.version) throw staleMockError("HEAD changed; refresh and select Amend again.");
+      if (demoSession.state !== "normal" || demoSession.mergeOrigin || rows.some(f => f.conflicted)) {
+        throw { code: "CONFLICTS_PRESENT", message: "Finish the current Git operation before amending.", recovery: "inspectState", retryable: false } satisfies AppError;
+      }
+    }
+    if (amendOid === null && !rows.some((f) => ![" ", "?", "!"].includes(f.indexStatus))) {
       const error: AppError = { code: "EMPTY_INDEX", message: "Nothing is staged.", recovery: "inspectState", retryable: false };
       throw error;
     }
     mockCommitCounter += 1;
     const oid = mockCommitCounter.toString(16).padStart(40, "a");
+    const previous = commitRows.find(row => row.oid === amendOid);
+    const currentRef = head.kind === "branch" ? head.refId : head.kind === "unborn" ? `refs/heads/${head.name}` : null;
+    const row: CommitRow = {
+      oid, subject: subject.trim(), parents: previous?.parents ?? (head.kind === "unborn" ? [] : [head.oid]),
+      authorName: previous?.authorName ?? "Demo Author", authoredAt: previous?.authoredAt ?? new Date().toISOString(),
+      committedAt: new Date().toISOString(), refs: currentRef ? [currentRef] : [], boundary: false
+    };
+    // All-refs history retains the old commit only while another ref or
+    // child still reaches it. Its details remain readable by object ID.
+    if (previous) supersededCommits.set(previous.oid, previous);
+    const remaining = commitRows.map(entry => ({ ...entry, refs: entry.refs.filter(ref => ref !== currentRef) }));
+    commitRows = [row, ...remaining.filter(entry => entry.oid !== amendOid || entry.refs.length > 0 || remaining.some(child => child.parents.includes(entry.oid)))];
+    commitBodies.set(oid, body.trim());
+    if (head.kind === "detached") demoSession.head = { kind: "detached", oid };
+    else {
+      const name = head.name;
+      demoSession.head = { kind: "branch", refId: currentRef!, name, oid };
+      const branch = mockBranches().find(ref => ref.refId === currentRef);
+      if (branch) branch.oid = oid;
+    }
+    demoSession.version += 1;
     // The commit consumes the index: staged-only rows vanish, staged AND
     // unstaged rows keep their worktree half.
     mockWorktreeByRepo.set(
@@ -227,7 +259,7 @@ const mockAdapter = {
     limit: number
   ): Promise<HistoryPage> {
     await new Promise((resolve) => setTimeout(resolve, 30));
-    const rows = demoRows();
+    const rows = commitRows;
     const offset = cursor === null ? 0 : Number.parseInt(cursor, 10);
     const slice = rows.slice(offset, offset + limit);
     const next = offset + limit < rows.length ? String(offset + limit) : null;
@@ -244,7 +276,7 @@ const mockAdapter = {
     const needle = query.trim().toLowerCase();
     if (needle === "") return { rows: [], nextCursor: null, incomplete: false };
     // Literal substring match, mirroring the backend literal rule (T04).
-    const matched = demoRows().filter(
+    const matched = commitRows.filter(
       (row) =>
         row.subject.toLowerCase().includes(needle) ||
         row.authorName.toLowerCase().includes(needle) ||
@@ -586,13 +618,13 @@ const mockAdapter = {
   },
   async commitDetails(_repoId: string, oid: string, parentIndex: number | null): Promise<CommitDetails> {
     await new Promise((resolve) => setTimeout(resolve, 30));
-    const commit = demoCommits.find((c) => c.oid === oid) ?? demoCommits[0];
+    const commit = commitRows.find((c) => c.oid === oid) ?? supersededCommits.get(oid) ?? commitRows[0];
     return {
       oid: commit.oid,
       subject: commit.subject,
-      body: "Demo body text.",
+      body: commitBodies.get(oid) ?? "Demo body text.",
       authorName: commit.authorName,
-      authoredAt: commit.committedAt,
+      authoredAt: commit.authoredAt,
       committedAt: commit.committedAt,
       parents: [...commit.parents],
       parentIndex: commit.parents.length === 0 ? null : (parentIndex ?? 0),

@@ -3,6 +3,7 @@ import type {
   BitbucketConnectionResult,
   BranchCreateResult,
   ClosedResponse,
+  CommitCreateRequest,
   CommitDetails,
   CommitResult,
   ConfirmationDetails,
@@ -227,14 +228,15 @@ export const realAdapter = {
   async identityRead(repoId: RepoId): Promise<IdentityInfo> {
     return invokeCommand<IdentityInfo>("identity_read", { requestId: newRequestId(), repoId });
   },
-  async commitCreate(repoId: RepoId, expectedVersion: number, subject: string, body: string): Promise<CommitResult> {
+  async commitCreate(repoId: RepoId, expectedVersion: number, subject: string, body: string, amendOid: string | null = null): Promise<CommitResult> {
     return invokeCommand<CommitResult>("commit_create", {
       requestId: newRequestId(),
       repoId,
       expectedVersion,
       subject,
-      body
-    });
+      body,
+      amendOid
+    } satisfies CommitCreateRequest);
   },
   async branchCreate(repoId: RepoId, expectedVersion: number, name: string, startOid: string, switchAfterCreate: boolean): Promise<BranchCreateResult> {
     return invokeCommand<BranchCreateResult>("branch_create", {
