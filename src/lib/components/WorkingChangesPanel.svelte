@@ -151,7 +151,6 @@
     Amend last commit
   </label>
   {#if amendLoading}<p class="gd-commit-hint" role="status">Loading last commit…</p>
-  {:else if amendOid}<p class="gd-amend-notice" role="status">{#if amendStale}HEAD changed or is not verified. Refresh or turn Amend off before continuing.{:else}Replaces <code>{amendOid.slice(0, 7)}</code> and rewrites its history. Only amend commits you have not shared.{/if}</p>
   {:else if amendUnavailable}<p class="gd-commit-hint">{amendUnavailable}</p>{/if}
   <label for={summaryId}>Summary</label>
   <input id={summaryId} aria-label="Commit subject" placeholder="What changed?" value={subject} maxlength="500" disabled={commitBusy || amendLoading} oninput={e => onSubject(e.currentTarget.value)} onkeydown={commitKey} />
@@ -181,7 +180,7 @@
   .gd-chevron { display: inline-block; width: 1.4ch; color: var(--gd-text-secondary); font-weight: 400; }
   .gd-group-title .gd-count { margin-left: 7px; padding: 1px 5px; background: var(--gd-surface-raised); color: var(--gd-text-secondary); border-radius: 3px; font-size: 10px; font-weight: 400; }
   .gd-editor-heading h3 { margin: 0; font-size: 12px; font-weight: 600; }
-  .gd-group-list { height: 260px; overflow-y: auto; overflow-x: hidden; }
+  .gd-group-list { height: 248px; overflow-y: auto; overflow-x: hidden; }
   ul { list-style: none; padding: 0; margin: 0; }
   .gd-group-actions { display: flex; align-items: center; gap: 8px; }
   .gd-text-action { border: 0; padding: 3px 4px; background: transparent; color: var(--gd-accent); font-size: 11px; cursor: pointer; }

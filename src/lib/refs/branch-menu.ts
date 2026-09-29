@@ -31,6 +31,10 @@ export interface BranchMenuContext {
   actionsDisabled: boolean;
   /** Selected graph commit; move targets it. Null disables move. */
   selectedCommitOid: string | null;
+  /** Merge target label ("main", "detached a1b2c3d4"). Null disables merge. */
+  mergeTarget: string | null;
+  /** A merge is already running; the merge entry waits for it. */
+  mergeBusy: boolean;
 }
 
 function copyItems(
@@ -82,6 +86,14 @@ export function resolveCheckoutTarget(refs: RefItem[], ref: RefItem): CheckoutTa
   const twin = refs.find((r) => r.kind === "local" && r.label === name);
   if (twin) return { refId: twin.refId, trackAs: null };
   return { refId: ref.refId, trackAs: name };
+}
+
+/**
+ * Whether double-clicking `ref` checks it out. Local and remote branch
+ * rows switch to that branch; tags have no checkout and stay put.
+ */
+export function canCheckoutRef(ref: RefItem): boolean {
+  return ref.kind === "local" || ref.kind === "remote";
 }
 
 /**
@@ -140,8 +152,18 @@ export function buildBranchMenuItems(
         },
     {
       id: "merge",
-      label: `Merge into current: ${ref.label}`,
-      disabled: locked,
+      label:
+        ctx.mergeTarget === null
+          ? `Merge into current: ${ref.label}`
+          : `Merge ${ref.label} into ${ctx.mergeTarget}`,
+      disabled: locked || ctx.mergeBusy || ref.current || ctx.mergeTarget === null,
+      title: ref.current
+        ? "Already the current branch"
+        : ctx.mergeBusy
+          ? "A merge is already running"
+          : ctx.mergeTarget === null
+            ? "No commits yet"
+            : undefined,
       action: go("merge")
     },
     {
