@@ -13,6 +13,10 @@
     onPush: () => void;
     onMerge: () => void;
     onStash: () => void;
+    onPopStash: () => void;
+    stashSaveBusy: boolean;
+    stashPopBusy: boolean;
+    stashBusy: boolean;
     onCancel: () => void;
     bitbucketAvailable: boolean;
     onConnectBitbucket: () => void;
@@ -31,6 +35,10 @@
     onPush,
     onMerge,
     onStash,
+    onPopStash,
+    stashSaveBusy,
+    stashPopBusy,
+    stashBusy,
     onCancel,
     bitbucketAvailable,
     onConnectBitbucket,
@@ -98,20 +106,22 @@
   <button
     type="button"
     class="gd-tool gd-tool-live"
-    disabled={syncDisabled}
-    title={syncDisabled ? syncDisabledReason : "Stash working changes (tracked-only by default)"}
+    disabled={syncDisabled || stashBusy}
+    title={syncDisabled ? syncDisabledReason : "Stash working changes now (tracked-only, default message)"}
+    aria-label={stashSaveBusy ? "Stashing" : "Stash"}
     onclick={onStash}
   >
-    Stash
+    {#if stashSaveBusy}<span class="gd-spin" aria-hidden="true">⟳</span>{:else}Stash{/if}
   </button>
   <button
     type="button"
     class="gd-tool gd-tool-live"
-    disabled={syncDisabled}
-    title={syncDisabled ? syncDisabledReason : "Open the stash dialog (save, apply, pop). Stash needs a trusted repository."}
-    onclick={onStash}
+    disabled={syncDisabled || stashBusy}
+    title={syncDisabled ? syncDisabledReason : "Pop the newest stash entry (stash@{0})"}
+    aria-label={stashPopBusy ? "Popping stash" : "Pop stash"}
+    onclick={onPopStash}
   >
-    Pop stash
+    {#if stashPopBusy}<span class="gd-spin" aria-hidden="true">⟳</span>{:else}Pop stash{/if}
   </button>
   <button
     type="button"

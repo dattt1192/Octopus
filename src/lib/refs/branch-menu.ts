@@ -84,6 +84,27 @@ export function resolveCheckoutTarget(refs: RefItem[], ref: RefItem): CheckoutTa
   return { refId: ref.refId, trackAs: name };
 }
 
+/**
+ * Whether checking out `ref` should pull right after the switch so the
+ * local branch lands on the latest remote state. Only trusted checkouts of
+ * real remote branches qualify: local rows, tags, untrusted repositories,
+ * and the `origin/HEAD` symref (which has no branch of its own) never do.
+ */
+export function shouldPullAfterCheckout(ref: RefItem, trusted: boolean): boolean {
+  if (ref.kind !== "remote" || !trusted) return false;
+  return suggestedTrackName(ref.label) !== "HEAD";
+}
+
+/**
+ * Opening tab of the Branches dialog. The "create here" flows arrive with an
+ * explicit start commit and land on the form; plain browsing lands on the
+ * local rows. The dialog's own start-commit display still falls back to HEAD
+ * when browsing, so callers must pass their own opener intent here.
+ */
+export function defaultBranchTab(createHere: boolean): "create" | "local" {
+  return createHere ? "create" : "local";
+}
+
 export function buildBranchMenuItems(
   ref: RefItem,
   ctx: BranchMenuContext,

@@ -1151,4 +1151,29 @@ mod tests {
         assert!(!page.rows[0].boundary, "tip is not a boundary");
         assert!(page.rows[1].boundary, "grafted commit is a boundary");
     }
+
+    #[tokio::test]
+    async fn all_refs_scope_spans_diverged_branches() {
+        let (runner, mut registry, mut store, root) = harness();
+        let repo = root.join("repo");
+        git(&root, &["init", "-b", "main", "repo"]);
+        commit_empty(&repo, "base", 1);
+        git(&repo, &["branch", "feature"]);
+        commit_empty(&repo, "main-only", 2);
+        git(&repo, &["checkout", "feature"]);
+        commit_empty(&repo, "feature-only", 3);
+        let repo_id = open_repo(&runner, &mut registry, &mut store, &repo).await;
+        let page = core_page(&runner, &mut registry, &repo_id, &scope_all(), None, 50)
+            .await
+            .expect("all page");
+        let subjects: Vec<&str> = page.rows.iter().map(|r| r.subject.as_str()).collect();
+        assert!(
+            subjects.contains(&"main-only"),
+            "main tip visible: {subjects:?}"
+        );
+        assert!(
+            subjects.contains(&"feature-only"),
+            "feature tip visible: {subjects:?}"
+        );
+    }
 }

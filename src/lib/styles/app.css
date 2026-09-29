@@ -17,3 +17,39 @@ body {
   background: var(--gd-canvas);
   color: var(--gd-text);
 }
+
+/* Themed scrollbars (single source): thin track, muted thumb that
+   brightens on hover. Firefox/WebKitGTK use scrollbar-color; Chromium
+   and desktop webviews use the pseudo-elements below. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--gd-border) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--gd-border);
+  border: 2px solid transparent;
+  border-radius: 6px;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--gd-text-secondary);
+  border: 2px solid transparent;
+  border-radius: 6px;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Shared with the diff tokenizer; merge content always passes through HTML escaping. */
+.gd-syntax .tok-kw { color: var(--gd-focus); }
+.gd-syntax .tok-str { color: var(--gd-warning); }
+.gd-syntax .tok-num { color: var(--gd-lane-4); }
+.gd-syntax .tok-com { color: var(--gd-text-secondary); font-style: italic; }

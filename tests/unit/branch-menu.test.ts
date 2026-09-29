@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { buildBranchMenuItems, pullRequestTargetName, resolveCheckoutTarget } from "../../src/lib/refs/branch-menu";
+import { buildBranchMenuItems, defaultBranchTab, pullRequestTargetName, resolveCheckoutTarget, shouldPullAfterCheckout } from "../../src/lib/refs/branch-menu";
 import type { RefItem } from "../../src/lib/ipc/types";
 
 function ref(overrides: Partial<RefItem> = {}): RefItem {
@@ -141,5 +141,23 @@ describe("branch context menu", () => {
     expect(onAction).toHaveBeenCalledWith("rename", expect.objectContaining({ label: "feature" }));
     items.find((item) => item.id === "copy-sha")?.action?.();
     expect(onCopy).toHaveBeenCalledWith("aaa");
+  });
+
+  it("pulls after checkout only for trusted remote checkouts", () => {
+    const remote = ref({ kind: "remote", refId: "refs/remotes/origin/feature", fullName: "refs/remotes/origin/feature", label: "origin/feature" });
+    expect(shouldPullAfterCheckout(remote, true)).toBe(true);
+    expect(shouldPullAfterCheckout(remote, false)).toBe(false);
+    expect(shouldPullAfterCheckout(ref(), true)).toBe(false);
+    expect(shouldPullAfterCheckout(ref({ kind: "tag" }), true)).toBe(false);
+  });
+
+  it("never auto-pulls the remote HEAD symref checkout", () => {
+    const head = ref({ kind: "remote", refId: "refs/remotes/origin/HEAD", fullName: "refs/remotes/origin/HEAD", label: "origin/HEAD" });
+    expect(shouldPullAfterCheckout(head, true)).toBe(false);
+  });
+
+  it("opens the Branches dialog on the create form only for create-here", () => {
+    expect(defaultBranchTab(true)).toBe("create");
+    expect(defaultBranchTab(false)).toBe("local");
   });
 });

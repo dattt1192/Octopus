@@ -1,3 +1,4 @@
+import { editableMergeText } from "../conflict/merge";
 import { demoPreflight } from "../../mocks/demoPreflight";
 import { demoCommits } from "../../mocks/demoRepo";
 import { demoRecents, demoSession as initialDemoSession } from "../../mocks/demoSession";
@@ -18,8 +19,13 @@ import type {
   IdentityInfo,
   ConflictAcceptResult,
   ConflictFile,
+  ConflictHunks,
+  ConflictAutoResolveResult,
   ConflictList,
+  ConflictMergeResult,
   ConflictPreview,
+  MergeBlockPick,
+  MergeSegment,
   MergeCompleteResult,
   MergeStartResult,
   SettingsV1,
@@ -63,6 +69,7 @@ let mockSettings: SettingsV1 = { version: 1, fontScale: 1 };
  */
 export function createMockAdapter(seed: RepoSnapshot = initialDemoSession) {
 const demoSession = structuredClone(seed);
+let conflictDoc: ConflictHunks | null = null;
 let commitRows = demoRows();
 const commitBodies = new Map<string, string>();
 const supersededCommits = new Map<string, CommitRow>();
@@ -289,7 +296,9 @@ const mockAdapter = {
   },
   async repoStatus(repoId: string): Promise<StatusData> {
     await new Promise((resolve) => setTimeout(resolve, 30));
-    return { files: structuredClone(mockWorktree(repoId)) };
+    const files = structuredClone(mockWorktree(repoId));
+    if ((demoSession.conflictCount ?? 0) > 0) files.push({ pathId: conflictDoc?.pathId ?? "demo:conflict:0", displayPath: "src/app/App.svelte", indexStatus: "U", worktreeStatus: "U", kind: "text", conflicted: true });
+    return { files };
   },
   async indexStage(repoId: string, _expectedVersion: number, pathIds: string[]): Promise<RepoSnapshot> {
     await new Promise((resolve) => setTimeout(resolve, 30));
@@ -455,7 +464,7 @@ const mockAdapter = {
     await new Promise((resolve) => setTimeout(resolve, 10));
     const files: ConflictFile[] = [
       {
-        pathId: "demo:conflict:0",
+        pathId: conflictDoc?.pathId ?? "demo:conflict:0",
         displayPath: "src/app/App.svelte",
         kind: "text",
         hasBase: true,
@@ -465,17 +474,17 @@ const mockAdapter = {
         supportReason: null
       }
     ];
-    return { files, canComplete: false, canAbort: true, abortReason: null };
+    return { files: (demoSession.conflictCount ?? 0) > 0 ? files : [], canComplete: demoSession.state === "merging" && demoSession.conflictCount === 0, canAbort: demoSession.state === "merging", abortReason: null };
   },
   async conflictPreview(_repoId: string, _pathId: string): Promise<ConflictPreview> {
     await new Promise((resolve) => setTimeout(resolve, 10));
     return {
-      pathId: "demo:conflict:0",
+      pathId: conflictDoc?.pathId ?? "demo:conflict:0",
       displayPath: "src/app/App.svelte",
       base: { text: "base line\n", truncated: false },
       current: { text: "base line\nmain line\n", truncated: false },
       incoming: { text: "base line\nfeature line\n", truncated: false },
-      workingFingerprint: "demofp:24",
+      workingFingerprint: conflictDoc?.workingFingerprint ?? "demofp:24",
       supportedActions: ["current", "incoming"],
       supportReason: null,
       currentLabel: "main",
@@ -488,21 +497,116 @@ const mockAdapter = {
   },
   async conflictMarkResolved(_repoId: string, _v: number, _p: string, _f: string, _r: string): Promise<RepoSnapshot> {
     await new Promise((resolve) => setTimeout(resolve, 10));
+    demoSession.conflictCount = 0;
     return structuredClone(demoSession);
+  },
+  async conflictHunks(_repoId: string, _pathId: string): Promise<ConflictHunks> {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    if (conflictDoc) {
+      if (_pathId !== conflictDoc.pathId) throw staleMockError();
+      return structuredClone(conflictDoc);
+    }
+    const doc: ConflictHunks = {
+      pathId: "demo:conflict:0",
+      displayPath: "src/app/App.svelte",
+      currentLabel: "main",
+      incomingLabel: "feature/ui",
+      workingFingerprint: "demofp:24",
+      workingText: "",
+      segments: [
+        { kind: "clean", lines: ["<script>", "  let count = 0;"] },
+        {
+          kind: "conflict",
+          hunkId: "demo-hunk-1",
+          current: ["  let label = \"main\";", "  label += \"!\";"],
+          incoming: ["  let label = \"feature\";"],
+          base: ["  let label = \"base\";"],
+          raw: "<<<<<<< HEAD\n  let label = \"main\";\n  label += \"!\";\n=======\n  let label = \"feature\";\n>>>>>>> feature/ui\n"
+        },
+        { kind: "clean", lines: ["  $effect(() => paint(count));", "</script>"] },
+        {
+          kind: "conflict",
+          hunkId: "demo-hunk-2",
+          current: ["  const cap = 24;", "  const floor = 0;"],
+          incoming: ["  const cap = 8;", "  const floor = 1;"],
+          base: ["  const cap = 8;", "  const floor = 0;"],
+          raw: "<<<<<<< HEAD\n  const cap = 24;\n  const floor = 0;\n=======\n  const cap = 8;\n  const floor = 1;\n>>>>>>> feature/ui\n"
+        }
+      ],
+      conflictCount: 2
+    };
+    doc.workingText = doc.segments.map((segment) => segment.kind === "clean" ? segment.lines.join("\n") + "\n" : segment.raw).join("");
+    conflictDoc = doc;
+    return structuredClone(doc);
+  },
+  async conflictAutoResolve(repoId: string, _version: number, pathId: string, fingerprint: string): Promise<ConflictAutoResolveResult> {
+    const doc = await mockAdapter.conflictHunks(repoId, pathId);
+    if (doc.workingFingerprint !== fingerprint) throw staleMockError();
+    const picks: MergeBlockPick[] = [];
+    // The demo fixture has two equal-length, unambiguous source ranges. Native
+    // resolution uses the Rust engine and the live index, including real bases.
+    for (const block of doc.segments) {
+      if (block.kind !== "conflict") continue;
+      const same = (a: string[], b: string[]) => a.length === b.length && a.every((line, i) => line === b[i]);
+      if (same(block.current, block.incoming)) {
+        picks.push({ hunkId: block.hunkId, lines: block.current.map((_, index) => ({ side: "current", index })) });
+      } else if (block.base.length && block.current.length === block.base.length && block.incoming.length === block.base.length) {
+        const lines: MergeBlockPick["lines"] = [];
+        let ambiguous = false;
+        for (let index = 0; index < block.base.length; index++) {
+          const current = block.current[index]; const incoming = block.incoming[index]; const base = block.base[index];
+          if (current === incoming || incoming === base) lines.push({ side: "current", index });
+          else if (current === base) lines.push({ side: "incoming", index });
+          else { ambiguous = true; break; }
+        }
+        if (!ambiguous) picks.push({ hunkId: block.hunkId, lines });
+      }
+    }
+    return { workingFingerprint: fingerprint, picks };
+  },
+  async conflictMerge(
+    _repoId: string, _v: number, _p: string, fingerprint: string,
+    picks: MergeBlockPick[], resultText: string | null = null
+  ): Promise<ConflictMergeResult> {
+    const doc = await mockAdapter.conflictHunks(_repoId, _p);
+    if (fingerprint !== doc.workingFingerprint) throw staleMockError();
+    const workingText = resultText ?? editableMergeText(doc, Object.fromEntries(picks.map((pick) => [pick.hunkId, pick.lines])));
+    const segments: MergeSegment[] = [];
+    // Demo-only marker parser, preserving enough state to reopen partial edits.
+    const pattern = /^<<<<<<<[^\n]*\n([\s\S]*?)^=======\r?\n([\s\S]*?)^>>>>>>>[^\n]*(?:\n|$)/gm;
+    let offset = 0;
+    const lines = (text: string) => text.replace(/\r\n/g, "\n").replace(/\n$/, "").split("\n");
+    for (const match of workingText.matchAll(pattern)) {
+      if (match.index > offset) segments.push({ kind: "clean", lines: lines(workingText.slice(offset, match.index)) });
+      segments.push({ kind: "conflict", hunkId: `demo-edited-${match.index}`, current: match[1] ? lines(match[1]) : [], incoming: match[2] ? lines(match[2]) : [], base: [], raw: match[0] });
+      offset = match.index + match[0].length;
+    }
+    if (offset < workingText.length) segments.push({ kind: "clean", lines: lines(workingText.slice(offset)) });
+    const remainingBlocks = segments.filter((segment) => segment.kind === "conflict").length;
+    conflictDoc = { ...doc, pathId: `${doc.pathId}:saved`, segments, workingText, conflictCount: remainingBlocks, workingFingerprint: `${fingerprint}-saved` };
+    return { snapshot: structuredClone(demoSession), workingFingerprint: conflictDoc.workingFingerprint,
+      resolvedBlocks: Math.max(0, doc.conflictCount - remainingBlocks), remainingBlocks };
   },
   async mergeStart(_repoId: string, _v: number, _s: string, _t: string): Promise<MergeStartResult> {
     await new Promise((resolve) => setTimeout(resolve, 10));
-    const snapshot = structuredClone(demoSession);
-    snapshot.state = "merging";
-    snapshot.mergeOrigin = "app";
-    return { snapshot, conflicted: true, alreadyUpToDate: false };
+    conflictDoc = null;
+    demoSession.state = "merging";
+    demoSession.mergeOrigin = "app";
+    demoSession.conflictCount = 1;
+    return { snapshot: structuredClone(demoSession), conflicted: true, alreadyUpToDate: false };
   },
   async mergeComplete(_repoId: string, _v: number, _s: string, _b: string, _r: boolean, _h: string): Promise<MergeCompleteResult> {
     await new Promise((resolve) => setTimeout(resolve, 10));
+    demoSession.state = "normal";
+    demoSession.mergeOrigin = null;
+    demoSession.conflictCount = 0;
     return { oid: "demo-merge-oid", snapshot: structuredClone(demoSession) };
   },
   async mergeAbort(_repoId: string, _v: number, _t: string): Promise<RepoSnapshot> {
     await new Promise((resolve) => setTimeout(resolve, 10));
+    demoSession.state = "normal";
+    demoSession.mergeOrigin = null;
+    demoSession.conflictCount = 0;
     return structuredClone(demoSession);
   },
   async branchMove(): Promise<RepoSnapshot> {
@@ -744,7 +848,7 @@ function mockSessionWithCounts(): RepoSnapshot {
   session.trust = "trusted";
   session.stagedCount = staged;
   session.unstagedCount = unstaged;
-  session.conflictCount = 0;
+  session.conflictCount = demoSession.conflictCount ?? 0;
   return session;
 }
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { mockAdapter } from "../../src/lib/ipc/mock";
+import { latestStashEntry } from "../../src/lib/stash/latest";
 
 describe("stash adapter (T12 demo surface)", () => {
   it("lists entries newest-first with OID identity", async () => {
@@ -28,5 +29,16 @@ describe("stash adapter (T12 demo surface)", () => {
     const popped = await mockAdapter.stashApply("demo", 1, first.stashId, first.oid, "pop");
     expect(popped.retained).toBe(false);
     expect(popped.dropError).toBeNull();
+  });
+});
+
+describe("latestStashEntry (header quick-pop target)", () => {
+  it("picks the newest entry from a newest-first list", async () => {
+    const entries = await mockAdapter.stashList("demo");
+    expect(latestStashEntry(entries)?.stashId).toBe("stash@{0}");
+  });
+
+  it("returns null when there is nothing to pop", () => {
+    expect(latestStashEntry([])).toBeNull();
   });
 });
