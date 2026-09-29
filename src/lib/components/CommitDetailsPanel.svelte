@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { AppError, CommitDetails, CommitFileChange, DiffTarget, RefItem } from "../ipc/types";
   import { refBadge } from "../history/refs";
+  import { formatDateTime } from "../format/date";
   import FileChangeRow from "./FileChangeRow.svelte";
   import ContextMenu from "./ContextMenu.svelte";
   import { pointFromContextEvent, type ContextMenuItem } from "../context-menu/model";
@@ -15,10 +16,6 @@
   const badges = $derived(refs.filter(r => r.oid === details?.oid).map(refBadge));
   const parent = $derived(details && details.parents.length ? details.parents[details.parentIndex ?? 0] : null);
   $effect(() => { details?.oid; query = ""; copyState = ""; });
-  function formattedDate(value: string): string {
-    const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? value : new Intl.DateTimeFormat("en", { dateStyle: "medium", timeStyle: "short" }).format(date);
-  }
   async function copyOid(): Promise<void> {
     const oid = details?.oid;
     if (!oid) return;
@@ -63,7 +60,7 @@
     <div class="gd-author-row">
       <span class="gd-avatar" aria-hidden="true">{details.authorName.trim().slice(0, 1).toUpperCase() || "?"}</span>
       <strong>{details.authorName}</strong>
-      <time datetime={details.committedAt} title={details.committedAt}>{formattedDate(details.committedAt)}</time>
+      <time datetime={details.committedAt}>{formatDateTime(details.committedAt)}</time>
     </div>
     {#if details.body}<p class="gd-message">{details.body}</p>{/if}
     <div class="gd-compare-bar" aria-label="Parent comparison">

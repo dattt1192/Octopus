@@ -2,6 +2,7 @@
   // Stash dialog (T12): save (tracked-only default, explicit untracked opt-in)
   // plus apply/pop per entry. Entries identify by OID; indices re-resolve.
   import type { AppError, StashEntry } from "../ipc/types";
+  import { formatDateTime } from "../format/date";
 
   interface Props {
     entries: StashEntry[];
@@ -54,7 +55,7 @@
 
   function createdLabel(createdAt: number): string {
     if (!createdAt) return "unknown time";
-    return new Date(createdAt * 1000).toLocaleString();
+    return formatDateTime(createdAt * 1000);
   }
 </script>
 

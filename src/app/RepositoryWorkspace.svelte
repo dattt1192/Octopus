@@ -4,6 +4,7 @@
   // and search; T07 wires worktree status with focus/event refresh.
   import { onMount, onDestroy, untrack } from "svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
+  import { formatDateTime } from "../lib/format/date";
   import BitbucketAuthModal from "../lib/components/BitbucketAuthModal.svelte";
   import DiscardConfirmModal from "../lib/components/DiscardConfirmModal.svelte";
   import GitActions from "../lib/components/GitActions.svelte";
@@ -511,7 +512,7 @@
   const remoteTitle = $derived.by(() => {
     if (!remoteStatus) return "No remote information for this repository";
     const url = remoteStatus.url ?? "unknown URL";
-    const fetched = remoteStatus.lastFetchAt ?? "never fetched";
+    const fetched = remoteStatus.lastFetchAt ? formatDateTime(remoteStatus.lastFetchAt) : "never fetched";
     return `${url} · last fetch: ${fetched}`;
   });
 
