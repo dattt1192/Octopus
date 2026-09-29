@@ -4,6 +4,7 @@
   // and search; T07 wires worktree status with focus/event refresh.
   import { onMount, onDestroy, untrack } from "svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
+  import { formatDateTime } from "../lib/format/date";
   import BitbucketAuthModal from "../lib/components/BitbucketAuthModal.svelte";
   import DiscardConfirmModal from "../lib/components/DiscardConfirmModal.svelte";
   import GitActions from "../lib/components/GitActions.svelte";
@@ -288,12 +289,17 @@
     return "No commits yet. Working changes are available in the inspector.";
   });
 
+  // Stale-while-revalidate: a reload keeps the old rows on screen and swaps
+  // in the new page when it lands, so checkout/scope changes never flash
+  // an empty "Loading history…" state. The token drops out-of-order pages.
+  let historyRequest = 0;
+
   async function loadHistory(first: boolean): Promise<void> {
     if (!session) return;
     const current = session;
+    const request = ++historyRequest;
     if (first) {
       historyLoading = true;
-      historyRows = [];
       historyCursor = null;
       historyTruncated = false;
       refLabels = new Map();
@@ -308,22 +314,26 @@
         first ? adapter.repoRefs(current.repoId) : Promise.resolve(null),
         adapter.historyPage(current.repoId, activeScope, historyCursor, HISTORY_LIMIT)
       ]);
+      if (request !== historyRequest || session === null || session.repoId !== current.repoId) return;
       if (refList) {
         const labels = new Map<string, string>();
         for (const ref of refList) labels.set(ref.refId, ref.label);
         refLabels = labels;
         refs = [...refList];
       }
-      historyRows = [...historyRows, ...page.rows];
+      historyRows = first ? [...page.rows] : [...historyRows, ...page.rows];
       historyCursor = page.nextCursor;
       historyHasMore = page.nextCursor !== null;
       // The backend flags truncation only on the final cached page.
       if (page.nextCursor === null) historyTruncated = page.truncated;
     } catch (e) {
+      if (request !== historyRequest || session === null || session.repoId !== current.repoId) return;
       historyError = e as AppError;
     } finally {
-      historyLoading = false;
-      historyLoadingMore = false;
+      if (request === historyRequest && session?.repoId === current.repoId) {
+        historyLoading = false;
+        historyLoadingMore = false;
+      }
     }
   }
 
@@ -502,7 +512,7 @@
   const remoteTitle = $derived.by(() => {
     if (!remoteStatus) return "No remote information for this repository";
     const url = remoteStatus.url ?? "unknown URL";
-    const fetched = remoteStatus.lastFetchAt ?? "never fetched";
+    const fetched = remoteStatus.lastFetchAt ? formatDateTime(remoteStatus.lastFetchAt) : "never fetched";
     return `${url} · last fetch: ${fetched}`;
   });
 
@@ -991,8 +1001,8 @@
     showMerge = true;
   }
 
-  async function startMerge(): Promise<void> {
-    if (!session || mergeBusy || !mergeSource || !mergeTargetOid) return;
+  async function startMerge(source: string, direct: boolean): Promise<void> {
+    if (!session || mergeBusy || source === "" || !mergeTargetOid) return;
     const current = session;
     mergeBusy = true;
     mergeError = null;
@@ -1001,7 +1011,7 @@
       const result = await mergeAdapter().mergeStart(
         current.repoId,
         current.version,
-        mergeSource,
+        source,
         mergeTargetOid
       );
       if (session === null || session.repoId !== current.repoId) return;
@@ -1018,7 +1028,13 @@
       await loadConflicts();
     } catch (e) {
       if (session === null || session.repoId !== current.repoId) return;
-      mergeError = e as AppError;
+      if (direct) {
+        // No dialog to show this in: surface it in the conflict inspector.
+        conflictError = e as AppError;
+        changeInspector("conflict");
+      } else {
+        mergeError = e as AppError;
+      }
       if (!demo) {
         try {
           session = await realAdapter.repoSnapshot(current.repoId, false);
@@ -2112,9 +2128,8 @@
         return;
       }
       case "merge":
-        mergeError = null;
         mergeSource = ref.refId;
-        showMerge = true;
+        await startMerge(ref.refId, true);
         return;
       case "create-branch":
         openBranchesAt(ref.oid);
@@ -2475,6 +2490,7 @@
     const current = session;
     const target = stashSwitch;
     stashSwitchBusy = true;
+    if (target.kind === "branch") branchBusyRef = target.refId;
     stashSwitchError = null;
     try {
       const stash = await statusAdapter().stashSave(
@@ -2519,9 +2535,15 @@
       await loadStatus();
       await loadHistory(true);
     } finally {
-      if (session?.repoId === current.repoId) stashSwitchBusy = false;
+      if (session?.repoId === current.repoId) {
+        stashSwitchBusy = false;
+        branchBusyRef = null;
+      }
     }
   }
+
+  /** Branch row showing the checkout spinner (right side) during a switch. */
+  let branchBusyRef: string | null = $state(null);
 
   async function switchBranch(refId: string, trackAs: string | null = null, pullAfter = false): Promise<boolean> {
     if (!session || branchBusy) return false;
@@ -2532,6 +2554,7 @@
       return false;
     }
     branchBusy = true;
+    branchBusyRef = refId;
     branchError = null;
     try {
       session = await statusAdapter().branchSwitch(current.repoId, current.version, refId, trackAs);
@@ -2544,7 +2567,10 @@
       await loadStatus();
       return false;
     } finally {
-      if (session?.repoId === current.repoId) branchBusy = false;
+      if (session?.repoId === current.repoId) {
+        branchBusy = false;
+        branchBusyRef = null;
+      }
     }
   }
 
@@ -2961,6 +2987,9 @@
         onStashPop={(entry) => void applyStash(entry, "pop")}
         onStashManage={openStash}
         onStashRetry={() => void loadStashList()}
+        mergeTarget={mergeTargetOid === null ? null : mergeTargetLabel}
+        mergeBusy={mergeBusy}
+        busyRefId={branchBusyRef}
       />
       <Splitter
         label="Resize sidebar"
@@ -3035,6 +3064,8 @@
         onLoadMore={() => void loadHistory(false)}
         branchActionsDisabled={busy || branchBusy || session?.trust !== "trusted"}
         onBranchAction={(action, ref) => void branchAction(action, ref)}
+        mergeTarget={mergeTargetOid === null ? null : mergeTargetLabel}
+        mergeBusy={mergeBusy}
       />
       </div>
       {#if diff.selection}
@@ -3310,7 +3341,7 @@
             ? "No other branch to merge from"
             : `Merge into ${mergeTargetLabel} with a review stop`}
       onSelectSource={(value) => (mergeSource = value)}
-      onStart={() => void startMerge()}
+      onStart={() => void startMerge(mergeSource, false)}
       onClose={() => (showMerge = false)}
     />
   {/if}
