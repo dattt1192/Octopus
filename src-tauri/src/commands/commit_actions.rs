@@ -882,7 +882,7 @@ async fn core_reword(
     let out = runner
         .run_with_stdin(
             &session.worktree_root,
-            &["commit", "--amend", "-F", "-"],
+            &["commit", "--amend", "--only", "-F", "-"],
             message.as_bytes(),
             WRITE_TIMEOUT,
         )
@@ -982,6 +982,7 @@ async fn core_edit_author(
             &[
                 "commit",
                 "--amend",
+                "--only",
                 "--no-edit",
                 &format!("--author={author}"),
             ],
@@ -2039,6 +2040,98 @@ mod tests {
         .await
         .expect_err("token required");
         assert_eq!(err.code, ErrorCode::INVALID_ARGUMENT);
+    }
+
+    #[tokio::test]
+    async fn metadata_edits_preserve_tree_index_and_unstaged_content() {
+        for edit_author in [false, true] {
+            let (_dir, repo) =
+                temp_repo(&format!("metadata-{edit_author}-{}", uuid::Uuid::new_v4()));
+            git(&repo, &["config", "user.name", "Fixture"]);
+            git(&repo, &["config", "user.email", "fixture@example.test"]);
+            git(&repo, &["config", "commit.gpgSign", "false"]);
+            commit_file(
+                &repo,
+                "tracked.txt",
+                "original\n",
+                "Original title\n\nOriginal body",
+            );
+            let tree = oid_of(&repo, "HEAD^{tree}");
+            let head = oid_of(&repo, "HEAD");
+            std::fs::write(repo.join("tracked.txt"), "staged\n").unwrap();
+            std::fs::write(repo.join("next.txt"), "next commit\n").unwrap();
+            git(&repo, &["add", "tracked.txt", "next.txt"]);
+            std::fs::write(repo.join("tracked.txt"), "unstaged\n").unwrap();
+            let runner = git_runner().unwrap();
+            let index_before = runner
+                .run(&repo, &["write-tree"], READ_TIMEOUT)
+                .await
+                .unwrap()
+                .stdout;
+            let mut registry = RepoRegistry::default();
+            let repo_id = open_repo(&mut registry, &repo, TrustState::Trusted);
+            let version = version_of(&registry, &repo_id);
+            if edit_author {
+                core_edit_author(
+                    &runner,
+                    &mut registry,
+                    &repo_id,
+                    version,
+                    &head,
+                    "New Author",
+                    "new@example.test",
+                )
+                .await
+                .unwrap();
+            } else {
+                core_reword(
+                    &runner,
+                    &mut registry,
+                    &repo_id,
+                    version,
+                    &head,
+                    "New title",
+                    "Original body",
+                )
+                .await
+                .unwrap();
+            }
+            assert_ne!(oid_of(&repo, "HEAD"), head);
+            assert_eq!(oid_of(&repo, "HEAD^{tree}"), tree);
+            assert_eq!(
+                runner
+                    .run(&repo, &["write-tree"], READ_TIMEOUT)
+                    .await
+                    .unwrap()
+                    .stdout,
+                index_before
+            );
+            assert_eq!(
+                std::fs::read_to_string(repo.join("tracked.txt")).unwrap(),
+                "unstaged\n"
+            );
+            let message = runner
+                .run(&repo, &["log", "-1", "--format=%B"], READ_TIMEOUT)
+                .await
+                .unwrap();
+            let message = String::from_utf8_lossy(&message.stdout);
+            assert!(message.contains("Original body"));
+            assert!(message.starts_with(if edit_author {
+                "Original title"
+            } else {
+                "New title"
+            }));
+            if edit_author {
+                let author = runner
+                    .run(&repo, &["log", "-1", "--format=%an <%ae>"], READ_TIMEOUT)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    String::from_utf8_lossy(&author.stdout).trim(),
+                    "New Author <new@example.test>"
+                );
+            }
+        }
     }
 
     #[tokio::test]
