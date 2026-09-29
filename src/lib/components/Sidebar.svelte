@@ -19,6 +19,7 @@
   import { windowRows } from "../graph/layout";
   import {
     buildBranchMenuItems,
+    canCheckoutRef,
     type BranchMenuAction
   } from "../refs/branch-menu";
 
@@ -43,6 +44,11 @@
     onStashPop: (entry: StashEntry) => void;
     onStashManage: () => void;
     onStashRetry: () => void;
+    /** Merge target label for the branch menu; null disables merge. */
+    mergeTarget?: string | null;
+    mergeBusy?: boolean;
+    /** Ref row showing the checkout spinner on its right side. */
+    busyRefId?: string | null;
   }
 
   let {
@@ -64,7 +70,10 @@
     onStashApply,
     onStashPop,
     onStashManage,
-    onStashRetry
+    onStashRetry,
+    mergeTarget = null,
+    mergeBusy = false,
+    busyRefId = null
   }: Props = $props();
 
   const localRefs = $derived(refs.filter((r) => r.kind === "local"));
@@ -137,7 +146,13 @@
     const parts = [ref.fullName, ref.oid.slice(0, 7)];
     if (ref.current) parts.push("checked out");
     if (ref.checkedOutElsewhere) parts.push("checked out in another worktree");
+    if (canCheckoutRef(ref) && !ref.current) parts.push("double-click to check out");
     return parts.join(" · ");
+  }
+
+  function doubleClickRef(ref: RefItem): void {
+    if (actionsDisabled || ref.current || !canCheckoutRef(ref)) return;
+    onBranchAction("checkout", ref);
   }
 
   function openRefMenu(event: MouseEvent | KeyboardEvent, ref: RefItem): void {
@@ -154,7 +169,7 @@
   function menuItems(ref: RefItem): ContextMenuItem[] {
     return buildBranchMenuItems(
       ref,
-      { actionsDisabled, selectedCommitOid },
+      { actionsDisabled, selectedCommitOid, mergeTarget, mergeBusy },
       (action, target) => onBranchAction(action, target),
       (text) => {
         void navigator.clipboard.writeText(text);
@@ -191,11 +206,15 @@
       class:contexted={refMenu?.ref.refId === ref.refId}
       title={refTitle(ref)}
       onclick={() => onRefSelect(ref.refId)}
+      ondblclick={() => doubleClickRef(ref)}
       oncontextmenu={(event) => openRefMenu(event, ref)}
       onkeydown={(event) => refMenuKey(event, ref)}
     >
       <span class="gd-ref-label">{ref.label}{ref.current ? " •" : ""}</span>
     </button>
+    {#if busyRefId === ref.refId}
+      <span class="gd-row-busy" role="status" aria-label="Switching branch"><span class="gd-spin" aria-hidden="true">⟳</span></span>
+    {/if}
   </li>
 {/snippet}
 
@@ -541,6 +560,23 @@
   }
   .gd-ref.contexted {
     background: var(--gd-surface-hover);
+  }
+  .gd-row-busy {
+    flex: 0 0 auto;
+    margin-left: auto;
+    padding-right: 10px;
+    color: var(--gd-accent);
+    font-size: var(--gd-font-size-small);
+  }
+  .gd-spin {
+    display: inline-block;
+    animation: gd-rotate 1s linear infinite;
+  }
+  @keyframes gd-rotate {
+    to { transform: rotate(360deg); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .gd-spin { animation: none; }
   }
   .gd-ref-search {
     width: 100%;
