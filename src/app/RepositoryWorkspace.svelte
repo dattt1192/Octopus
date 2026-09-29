@@ -4,6 +4,7 @@
   // and search; T07 wires worktree status with focus/event refresh.
   import { onMount, onDestroy, untrack } from "svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
+  import { formatDateTime } from "../lib/format/date";
   import BitbucketAuthModal from "../lib/components/BitbucketAuthModal.svelte";
   import DiscardConfirmModal from "../lib/components/DiscardConfirmModal.svelte";
   import GitActions from "../lib/components/GitActions.svelte";
@@ -14,6 +15,8 @@
   import SettingsModal from "../lib/components/SettingsModal.svelte";
   import StashModal from "../lib/components/StashModal.svelte";
   import DiffPane from "../lib/components/DiffPane.svelte";
+  import ConflictMergePane from "../lib/components/ConflictMergePane.svelte";
+  import { applyAutoPicks, serializeMergeText, takeSide, toggleLine, type MergePicks } from "../lib/conflict/merge";
   import { DiffController, emptyDiffState } from "../lib/diff/controller";
   import HistoryPane from "../lib/components/HistoryPane.svelte";
   import BranchModal from "../lib/components/BranchModal.svelte";
@@ -22,7 +25,9 @@
   import { COMMIT_ACTION_FORMS } from "../lib/history/commit-action-forms";
   import type { CommitActionId } from "../lib/history/commit-menu";
   import type { BranchFormOverride } from "../lib/history/commit-action-forms";
-  import { pullRequestTargetName, resolveCheckoutTarget, type BranchMenuAction } from "../lib/refs/branch-menu";
+  import { defaultBranchTab, pullRequestTargetName, resolveCheckoutTarget, shouldPullAfterCheckout, type BranchMenuAction } from "../lib/refs/branch-menu";
+  import { activeRefHighlight, scopeAfterRefDelete } from "../lib/refs/history-scope";
+  import { latestStashEntry } from "../lib/stash/latest";
   import Inspector from "../lib/components/Inspector.svelte";
   import Sidebar from "../lib/components/Sidebar.svelte";
   import Splitter from "../lib/components/Splitter.svelte";
@@ -41,6 +46,7 @@
     CommitDetails,
     CommitRow,
     ConflictFile,
+    ConflictHunks,
     ConflictPreview,
     HistoryScope,
     OperationLogEntry,
@@ -60,6 +66,7 @@
 
   import { SearchController } from "../lib/search/controller";
   import { clampWidth, initialShell, SHELL_LIMITS, type InspectorState } from "../lib/state/shell";
+  import { canResumeAmend, readCommitDraft } from "../lib/state/commit-draft";
   import { layoutGraph } from "../lib/graph/layout";
   import { headLabel } from "../mocks/demoSession";
 
@@ -99,6 +106,8 @@
   // search responses; switching repo/scope/clear invalidates in-flight work.
   let scope: HistoryScope = $state({ ...ALL_REFS_SCOPE });
   let scopeValue = $state("all");
+  /** Sidebar row highlight. Selecting a ref never narrows the graph. */
+  let selectedRefId: string | null = $state(null);
   let refs: RefItem[] = $state([]);
   const searchController = new SearchController();
   let searchTimer: ReturnType<typeof setTimeout> | undefined = undefined;
@@ -175,6 +184,18 @@
   let commitBusy = $state(false);
   let commitError: AppError | null = $state(null);
   let identityLabel: string | null = $state(null);
+  let amendOid: string | null = $state(null);
+  let amendLoading = $state(false);
+  let amendNeedsValidation = $state(false);
+  let newCommitDraft = $state<{ subject: string; body: string } | null>(null);
+  const amendUnavailable = $derived(
+    session?.head.kind === "unborn" ? "Create the first commit before using Amend."
+      : session?.state !== "normal" || session?.mergeOrigin ? "Finish the current Git operation before amending."
+      : null
+  );
+  const amendStale = $derived(amendOid !== null && (
+    amendNeedsValidation || !session || !canResumeAmend(amendOid, session)
+  ));
 
   // Branch dialog (T10).
   let showBranches = $state(false);
@@ -183,12 +204,12 @@
   let newBranchName = $state("");
   let switchAfterCreate = $state(true);
   let branchStartOid: string | null = $state(null);
-  let trackName = $state("");
+  let branchesInitialTab: "create" | "local" = $state("local");
   let deleteConfirm: { refId: string; summary: string; token: string } | null = $state(null);
 
   // Stash-and-switch offer when the worktree is dirty.
   type StashSwitchTarget =
-    | { kind: "branch"; refId: string; label: string; trackName: string | null }
+    | { kind: "branch"; refId: string; label: string; trackName: string | null; pullAfter: boolean }
     | { kind: "checkout"; oid: string; label: string };
   let stashSwitch: StashSwitchTarget | null = $state(null);
   let stashSwitchIncludeUntracked = $state(true);
@@ -202,6 +223,7 @@
   // Commit history actions (T18): one modal per action except create-branch.
   let historyAction: { action: CommitActionId; row: CommitRow } | null = $state(null);
   let historyActionBusy = $state(false);
+  let historyMessage: { subject: string; body: string } | null = $state(null);
   let historyActionError: AppError | null = $state(null);
   let historyConfirmSummary: string | null = $state(null);
   let historyConfirmToken: string | null = $state(null);
@@ -257,7 +279,7 @@
     return options;
   });
 
-  const activeRefId = $derived(scope.type === "ref" ? (scope.refId ?? null) : null);
+  const activeRefId = $derived(activeRefHighlight(scope, selectedRefId));
   const searchActive = $derived(searchQuery.trim() !== "");
   const emptyHint = $derived.by(() => {
     const head = session?.head;
@@ -267,12 +289,17 @@
     return "No commits yet. Working changes are available in the inspector.";
   });
 
+  // Stale-while-revalidate: a reload keeps the old rows on screen and swaps
+  // in the new page when it lands, so checkout/scope changes never flash
+  // an empty "Loading history…" state. The token drops out-of-order pages.
+  let historyRequest = 0;
+
   async function loadHistory(first: boolean): Promise<void> {
     if (!session) return;
     const current = session;
+    const request = ++historyRequest;
     if (first) {
       historyLoading = true;
-      historyRows = [];
       historyCursor = null;
       historyTruncated = false;
       refLabels = new Map();
@@ -287,22 +314,26 @@
         first ? adapter.repoRefs(current.repoId) : Promise.resolve(null),
         adapter.historyPage(current.repoId, activeScope, historyCursor, HISTORY_LIMIT)
       ]);
+      if (request !== historyRequest || session === null || session.repoId !== current.repoId) return;
       if (refList) {
         const labels = new Map<string, string>();
         for (const ref of refList) labels.set(ref.refId, ref.label);
         refLabels = labels;
         refs = [...refList];
       }
-      historyRows = [...historyRows, ...page.rows];
+      historyRows = first ? [...page.rows] : [...historyRows, ...page.rows];
       historyCursor = page.nextCursor;
       historyHasMore = page.nextCursor !== null;
       // The backend flags truncation only on the final cached page.
       if (page.nextCursor === null) historyTruncated = page.truncated;
     } catch (e) {
+      if (request !== historyRequest || session === null || session.repoId !== current.repoId) return;
       historyError = e as AppError;
     } finally {
-      historyLoading = false;
-      historyLoadingMore = false;
+      if (request === historyRequest && session?.repoId === current.repoId) {
+        historyLoading = false;
+        historyLoadingMore = false;
+      }
     }
   }
 
@@ -407,18 +438,31 @@
     await loadStatus();
   }
 
-  async function refreshActivatedRepository(): Promise<void> {
+  async function refreshActivatedRepository(reloadHistory = true): Promise<void> {
     const current = session;
     if (!current || busy || indexBusy || commitBusy || branchBusy || syncJobActive || mergeBusy || conflictBusy || stashSaveBusy || stashBusyEntry) return;
     try {
-      const fresh = demo ? await mockAdapter.repoSnapshot() : await realAdapter.repoSnapshot(current.repoId, false);
+      const fresh = demo ? await mockAdapter.repoSnapshot() : await realAdapter.repoSnapshot(current.repoId, amendNeedsValidation);
       if (disposed) return;
       const headChanged = JSON.stringify(current.head) !== JSON.stringify(fresh.head);
       session = fresh;
+      if (amendNeedsValidation) {
+        amendNeedsValidation = false;
+        sessionError = null;
+        commitError = null;
+        if (amendOid && !canResumeAmend(amendOid, fresh)) {
+          commitError = { code: "STALE_STATE", message: "HEAD changed while Octopus was closed. Your amend draft is preserved; turn Amend off to restore your new-commit draft.", recovery: "inspectState", retryable: false };
+        }
+      }
       await refreshStatusQuiet();
       await loadRemoteStatus();
-      if (headChanged) await loadHistory(true);
-    } catch (e) { if (!disposed) sessionError = e as AppError; }
+      if (headChanged && reloadHistory) await loadHistory(true);
+    } catch (e) {
+      if (!disposed) {
+        sessionError = e as AppError;
+        if (amendNeedsValidation) commitError = { ...(e as AppError), message: "Could not verify HEAD for the saved amend draft. Refresh working changes to retry, or turn Amend off." };
+      }
+    }
   }
 
   function unsubscribeInvalidated(): void {
@@ -468,7 +512,7 @@
   const remoteTitle = $derived.by(() => {
     if (!remoteStatus) return "No remote information for this repository";
     const url = remoteStatus.url ?? "unknown URL";
-    const fetched = remoteStatus.lastFetchAt ?? "never fetched";
+    const fetched = remoteStatus.lastFetchAt ? formatDateTime(remoteStatus.lastFetchAt) : "never fetched";
     return `${url} · last fetch: ${fetched}`;
   });
 
@@ -807,7 +851,7 @@
     if (!session) return;
     try {
       const drafts = readJson(DRAFTS_KEY);
-      drafts[session.workspaceKey] = { subject: shell.commitMessage, body: commitBody };
+      drafts[session.workspaceKey] = { subject: shell.commitMessage, body: commitBody, amendOid, newCommitDraft };
       localStorage.setItem(DRAFTS_KEY, JSON.stringify(drafts));
     } catch {
       // Drafts are best-effort; the commit boxes always work without them.
@@ -815,11 +859,12 @@
   }
 
   function restoreDraft(workspaceKey: string): void {
-    const entry = (readJson(DRAFTS_KEY)[workspaceKey] ?? readJson("gitdock.drafts.v1")[session?.repoId ?? ""]) as
-      | { subject?: unknown; body?: unknown }
-      | undefined;
-    shell.commitMessage = typeof entry?.subject === "string" ? entry.subject : "";
-    commitBody = typeof entry?.body === "string" ? entry.body : "";
+    const entry = readCommitDraft(readJson(DRAFTS_KEY)[workspaceKey] ?? readJson("gitdock.drafts.v1")[session?.repoId ?? ""]);
+    shell.commitMessage = entry.subject;
+    commitBody = entry.body;
+    amendOid = entry.amendOid;
+    newCommitDraft = entry.newCommitDraft;
+    amendNeedsValidation = amendOid !== null;
   }
 
   function persistWidths(): void {
@@ -863,6 +908,27 @@
   let conflictBusy: string | null = $state(null);
   let conflictActionError: AppError | null = $state(null);
   let conflictNotice: string | null = $state(null);
+  let mergeDoc: ConflictHunks | null = $state(null);
+  let mergeLoading = $state(false);
+  let mergeHunksError: AppError | null = $state(null);
+  let mergePicks: MergePicks = $state({});
+  let mergeManualText = $state<string | null>(null);
+  let mergeLoadRequest = 0;
+  const mergeDraftCache = new Map<string, { doc: ConflictHunks; picks: MergePicks; text: string | null }>();
+  const unresolvedFiles = $derived.by(() => statusFiles === null ? (session?.conflictCount ?? 0) : statusFiles.filter((file) => file.conflicted).length);
+  function rememberMergeDraft(): void {
+    if (mergeDoc && (mergeManualText !== null || Object.keys(mergePicks).length)) {
+      mergeDraftCache.set(mergeDoc.displayPath, { doc: mergeDoc, picks: mergePicks, text: mergeManualText });
+    } else if (mergeDoc) {
+      mergeDraftCache.delete(mergeDoc.displayPath);
+    }
+  }
+
+  let mergeApplying = $state(false);
+  let mergeAutoResolving = $state(false);
+  let mergeAutoRequest = 0;
+  let mergeApplyError: AppError | string | null = $state(null);
+  let mergeNotice: string | null = $state(null);
   let mergeSubject = $state("");
   let reviewedStaged = $state(false);
 
@@ -935,8 +1001,8 @@
     showMerge = true;
   }
 
-  async function startMerge(): Promise<void> {
-    if (!session || mergeBusy || !mergeSource || !mergeTargetOid) return;
+  async function startMerge(source: string, direct: boolean): Promise<void> {
+    if (!session || mergeBusy || source === "" || !mergeTargetOid) return;
     const current = session;
     mergeBusy = true;
     mergeError = null;
@@ -945,12 +1011,13 @@
       const result = await mergeAdapter().mergeStart(
         current.repoId,
         current.version,
-        mergeSource,
+        source,
         mergeTargetOid
       );
       if (session === null || session.repoId !== current.repoId) return;
       session = result.snapshot;
       showMerge = false;
+      mergeDraftCache.clear();
       changeInspector("conflict");
       conflictNotice = result.alreadyUpToDate
         ? "Already up to date — nothing to merge."
@@ -961,7 +1028,13 @@
       await loadConflicts();
     } catch (e) {
       if (session === null || session.repoId !== current.repoId) return;
-      mergeError = e as AppError;
+      if (direct) {
+        // No dialog to show this in: surface it in the conflict inspector.
+        conflictError = e as AppError;
+        changeInspector("conflict");
+      } else {
+        mergeError = e as AppError;
+      }
       if (!demo) {
         try {
           session = await realAdapter.repoSnapshot(current.repoId, false);
@@ -1002,9 +1075,10 @@
     }
   }
 
-  async function loadConflicts(selectFirst: boolean = true): Promise<void> {
+  async function loadConflicts(selectFirst: boolean = true, openEditor = true): Promise<void> {
     if (!session) return;
     const current = session;
+    const selectedPath = conflictFiles?.find((file) => file.pathId === conflictSelected)?.displayPath;
     conflictLoading = true;
     conflictError = null;
     try {
@@ -1015,15 +1089,14 @@
       canAbort = list.canAbort;
       abortReason = list.abortReason;
       reviewedStaged = true;
-      if (selectFirst) {
-        conflictSelected = list.files[0]?.pathId ?? null;
-        conflictPreview = null;
-        conflictPreviewError = null;
-        if (conflictSelected) await loadConflictPreview(conflictSelected);
-      } else if (conflictSelected && !list.files.some((f) => f.pathId === conflictSelected)) {
-        conflictSelected = list.files[0]?.pathId ?? null;
-        conflictPreview = null;
-        if (conflictSelected) await loadConflictPreview(conflictSelected);
+      const next = selectFirst ? list.files[0] : list.files.find((file) => file.displayPath === selectedPath) ?? list.files[0];
+      const changed = conflictSelected !== (next?.pathId ?? null);
+      conflictSelected = next?.pathId ?? null;
+      conflictPreview = null;
+      conflictPreviewError = null;
+      if (conflictSelected) {
+        await loadConflictPreview(conflictSelected);
+        if (openEditor && (selectFirst || changed)) openMergeConflict(conflictSelected);
       }
     } catch (e) {
       if (session === null || session.repoId !== current.repoId) return;
@@ -1054,11 +1127,155 @@
   }
 
   function selectConflict(pathId: string): void {
+    if (mergeApplying || mergeAutoResolving || conflictBusy !== null) return;
     acceptConfirm = null;
     conflictSelected = pathId;
     conflictPreview = null;
     conflictPreviewError = null;
     void loadConflictPreview(pathId);
+    openMergeConflict(pathId);
+  }
+
+  function closeMerge(preserve = true): void {
+    if (preserve) rememberMergeDraft();
+    mergeLoadRequest += 1;
+    mergeManualText = null;
+    mergeDoc = null;
+    mergeLoading = false;
+    mergeHunksError = null;
+    mergePicks = {};
+    mergeApplying = false;
+    mergeAutoRequest += 1;
+    mergeAutoResolving = false;
+    mergeApplyError = null;
+    mergeNotice = null;
+  }
+
+  async function loadMergeHunks(pathId: string, discardDraft = false): Promise<void> {
+    if (!session) return;
+    const current = session;
+    const request = ++mergeLoadRequest;
+    mergeLoading = true;
+    mergeHunksError = null;
+    try {
+      const doc = await mergeAdapter().conflictHunks(current.repoId, pathId);
+      if (session?.repoId !== current.repoId || request !== mergeLoadRequest) return;
+      if (discardDraft) mergeDraftCache.delete(doc.displayPath);
+      const draft = mergeDraftCache.get(doc.displayPath);
+      mergeDoc = draft ? { ...draft.doc, pathId: doc.pathId } : doc;
+      mergePicks = draft?.picks ?? {};
+      mergeManualText = draft?.text ?? null;
+      if (draft && draft.doc.workingFingerprint !== doc.workingFingerprint) {
+        mergeHunksError = { code: "STALE_STATE", message: "The file changed on disk. Your draft is kept; copy it before reloading if needed.", recovery: "refresh", retryable: false };
+      }
+    } catch (e) {
+      if (session?.repoId !== current.repoId || request !== mergeLoadRequest) return;
+      mergeHunksError = e as AppError;
+    } finally {
+      if (session?.repoId === current.repoId && request === mergeLoadRequest) mergeLoading = false;
+    }
+  }
+
+  function openMergeConflict(pathId: string): void {
+    if (mergeApplying || mergeAutoResolving) return;
+    rememberMergeDraft();
+    mergeManualText = null;
+    mergePicks = {};
+    clearDiff();
+    mergeDoc = null;
+    mergeApplyError = null;
+    mergeNotice = null;
+    void loadMergeHunks(pathId);
+  }
+
+  function mergeTakeSide(hunkId: string, side: "current" | "incoming"): void {
+    const block = mergeDoc?.segments.find((s) => s.kind === "conflict" && s.hunkId === hunkId);
+    if (!block || block.kind !== "conflict") return;
+    mergeNotice = null;
+    mergePicks = { ...mergePicks, [hunkId]: takeSide(block, side) };
+  }
+
+  function mergeToggleLine(hunkId: string, side: "current" | "incoming", index: number): void {
+    mergeNotice = null;
+    mergePicks = toggleLine(mergePicks, hunkId, side, index);
+  }
+
+  function mergeClearBlock(hunkId: string): void {
+    mergeNotice = null;
+    const next = { ...mergePicks };
+    delete next[hunkId];
+    mergePicks = next;
+  }
+
+  async function autoResolveMerge(): Promise<void> {
+    if (!session || !mergeDoc || mergeApplying || mergeAutoResolving || mergeManualText !== null) return;
+    const current = session;
+    const doc = mergeDoc;
+    const request = ++mergeAutoRequest;
+    mergeAutoResolving = true;
+    mergeApplyError = null;
+    mergeNotice = null;
+    try {
+      const result = await mergeAdapter().conflictAutoResolve(current.repoId, current.version, doc.pathId, doc.workingFingerprint);
+      if (request !== mergeAutoRequest || session?.repoId !== current.repoId || mergeDoc !== doc || mergeManualText !== null) return;
+      if (result.workingFingerprint !== doc.workingFingerprint) throw { code: "STALE_STATE", message: "The file changed. Reload before auto resolving." };
+      const resolution = applyAutoPicks(doc.segments, mergePicks, result.picks);
+      mergePicks = resolution.picks;
+      mergeNotice = resolution.added
+        ? `Auto-resolved ${resolution.added} block(s); ${resolution.remaining} still need review. Review Result, then Apply to save.`
+        : "No additional conflicts could be resolved automatically. Review the remaining blocks.";
+    } catch (e) {
+      if (request === mergeAutoRequest && mergeDoc === doc && session?.repoId === current.repoId) mergeApplyError = e as AppError;
+    } finally {
+      if (request === mergeAutoRequest) mergeAutoResolving = false;
+    }
+  }
+
+  async function applyMerge(): Promise<void> {
+    if (!session || !mergeDoc || mergeApplying || mergeAutoResolving) return;
+    const current = session;
+    const doc = mergeDoc;
+    const blockPicks = Object.entries(mergePicks)
+      .map(([hunkId, lines]) => ({ hunkId, lines }));
+    if (blockPicks.length === 0 && mergeManualText === null) return;
+    mergeApplying = true;
+    mergeApplyError = null;
+    mergeNotice = null;
+    try {
+      const result = await mergeAdapter().conflictMerge(
+        current.repoId,
+        current.version,
+        doc.pathId,
+        doc.workingFingerprint,
+        mergeManualText === null ? blockPicks : [],
+        mergeManualText === null ? null : serializeMergeText(mergeManualText, doc.workingText)
+      );
+      if (session === null || session.repoId !== current.repoId) return;
+      session = result.snapshot;
+      mergeDraftCache.delete(doc.displayPath);
+      // A write refreshes the status tokens. Drop the saved draft before reopening
+      // and use the new token from conflictList, never the pre-write pathId.
+      mergeLoadRequest += 1;
+      mergeDoc = null;
+      mergeManualText = null;
+      mergePicks = {};
+      await loadStatus();
+      await loadConflicts(false, false);
+      if (result.remainingBlocks === 0) {
+        closeMerge(false);
+        conflictNotice = `Resolved all ${result.resolvedBlocks} block(s). Mark it resolved when the file looks right.`;
+      } else {
+        mergeNotice = `Resolved ${result.resolvedBlocks} block(s), ${result.remainingBlocks} remaining.`;
+        const refreshed = conflictFiles?.find((file) => file.displayPath === doc.displayPath);
+        if (refreshed) await loadMergeHunks(refreshed.pathId);
+      }
+    } catch (e) {
+      if (session === null || session.repoId !== current.repoId) return;
+      mergeApplyError = e as AppError;
+      rememberMergeDraft();
+    } finally {
+      if (session?.repoId === current.repoId) mergeApplying = false;
+    }
   }
 
   async function askAccept(side: string): Promise<void> {
@@ -1106,6 +1323,8 @@
       if (session === null || session.repoId !== current.repoId) return;
       session = result.snapshot;
       acceptConfirm = null;
+      if (conflictPreview) mergeDraftCache.delete(conflictPreview.displayPath);
+      closeMerge(false);
       conflictNotice = `Applied the ${side} version (unstaged). Mark it resolved when the file looks right.`;
       await loadStatus();
       await loadConflicts(false);
@@ -1148,6 +1367,8 @@
         resolution === "deletion"
           ? "Staged the deletion. Complete the merge when every file is resolved."
           : "Staged as resolved. Complete the merge when every file is resolved.";
+      mergeDraftCache.delete(conflictPreview.displayPath);
+      closeMerge(false);
       await loadStatus();
       await loadConflicts();
     } catch (e) {
@@ -1187,6 +1408,7 @@
       if (session === null || session.repoId !== current.repoId) return;
       session = result.snapshot;
       mergeSubject = "";
+      mergeDraftCache.clear();
       reviewedStaged = false;
       changeInspector("working");
       conflictNotice = null;
@@ -1244,6 +1466,8 @@
       if (session === null || session.repoId !== current.repoId) return;
       abortConfirm = null;
       abortConfirmToken.current = null;
+      mergeDraftCache.clear();
+      closeMerge(false);
       changeInspector("working");
       await loadStatus();
       await loadConflicts(false);
@@ -1262,7 +1486,7 @@
     }
   }
 
-  async function saveStash(): Promise<void> {
+  async function saveStash(message: string, includeUntracked: boolean): Promise<void> {
     if (!session || stashSaveBusy) return;
     const current = session;
     stashError = null;
@@ -1272,8 +1496,8 @@
       const result = await stashAdapter().stashSave(
         current.repoId,
         current.version,
-        stashMessage,
-        stashIncludeUntracked
+        message,
+        includeUntracked
       );
       if (session === null || session.repoId !== current.repoId) return;
       session = result.snapshot;
@@ -1345,6 +1569,28 @@
     } finally {
       if (session?.repoId === current.repoId) stashBusyEntry = null;
     }
+  }
+
+  /**
+   * Header quick actions: act immediately without opening the dialog and
+   * surface the result in the Stashes sidebar section.
+   */
+  async function quickStash(): Promise<void> {
+    section = "stashes";
+    await saveStash("", false);
+  }
+
+  async function quickPop(): Promise<void> {
+    section = "stashes";
+    await loadStashList();
+    if (!session) return;
+    const latest = latestStashEntry(stashEntries);
+    if (latest === null) {
+      stashError = null;
+      stashNotice = "No stashed changes to pop.";
+      return;
+    }
+    await applyStash(latest, "pop");
   }
 
   /**
@@ -1696,12 +1942,47 @@
     await loadIdentity();
   }
 
+  async function toggleAmend(enabled: boolean): Promise<void> {
+    if (!session || commitBusy || amendLoading) return;
+    commitError = null;
+    if (!enabled) {
+      amendOid = null;
+      amendNeedsValidation = false;
+      if (newCommitDraft) {
+        shell.commitMessage = newCommitDraft.subject;
+        commitBody = newCommitDraft.body;
+        newCommitDraft = null;
+      }
+      return;
+    }
+    if (amendUnavailable || session.head.kind === "unborn") return;
+    const current = session;
+    const oid = session.head.oid;
+    amendLoading = true;
+    try {
+      const details = await historyAdapter().commitDetails(current.repoId, oid, null);
+      if (session?.repoId !== current.repoId) return;
+      if (!("oid" in session.head) || session.head.oid !== oid || details.oid !== oid || amendUnavailable) {
+        throw { code: "STALE_STATE", message: "HEAD changed while loading the commit. Refresh and select Amend again.", recovery: "refresh", retryable: false } satisfies AppError;
+      }
+      newCommitDraft = { subject: shell.commitMessage, body: commitBody };
+      shell.commitMessage = details.subject;
+      commitBody = details.body;
+      amendOid = oid;
+      amendNeedsValidation = false;
+    } catch (error) {
+      commitError = error as AppError;
+    } finally {
+      amendLoading = false;
+    }
+  }
+
   /**
    * Commit exactly the index. The draft (subject + body) survives every
    * failure and clears only on success; the selection clears with it.
    */
   async function commitSelected(): Promise<void> {
-    if (!session || commitBusy) return;
+    if (!session || commitBusy || amendLoading || amendStale || indexBusy || statusLoading) return;
     const current = session;
     const subject = shell.commitMessage;
     if (subject.trim() === "") return;
@@ -1712,12 +1993,15 @@
         current.repoId,
         current.version,
         subject,
-        commitBody
+        commitBody,
+        amendOid
       );
       if (session === null || session.repoId !== current.repoId) return;
       session = result.snapshot;
-      shell.commitMessage = "";
-      commitBody = "";
+      shell.commitMessage = newCommitDraft?.subject ?? "";
+      commitBody = newCommitDraft?.body ?? "";
+      amendOid = null;
+      newCommitDraft = null;
       clearDiff();
       await reloadAfterMutation();
     } catch (e) {
@@ -1745,6 +2029,7 @@
     branchError = null;
     deleteConfirm = null;
     branchStartOid = startOid;
+    branchesInitialTab = defaultBranchTab(startOid !== null);
     showBranches = true;
   }
 
@@ -1773,32 +2058,43 @@
     if (!session) return;
     const current = session;
     historyAction = { action, row };
+    const opening = historyAction;
+    historyMessage = null;
     historyActionError = null;
     historyConfirmSummary = null;
     historyConfirmToken = null;
     const form = COMMIT_ACTION_FORMS[action];
-    if (!form.confirmAction) return;
+    if (!form.confirmAction && action !== "reword") return;
     historyActionBusy = true;
     try {
+      if (action === "reword") {
+        const details = await historyAdapter().commitDetails(current.repoId, row.oid, null);
+        if (historyAction !== opening || session?.repoId !== current.repoId) return;
+        if (details.oid !== row.oid) throw { code: "STALE_STATE", message: "The selected commit changed. Close and reopen Reword.", recovery: "refresh", retryable: false } satisfies AppError;
+        historyMessage = { subject: details.subject, body: details.body };
+        return;
+      }
       const details = await statusAdapter().confirmationPrepare(
         current.repoId,
         current.version,
-        form.confirmAction,
+        form.confirmAction!,
         [row.oid]
       );
-      if (historyAction?.row.oid !== row.oid || session?.repoId !== current.repoId) return;
+      if (historyAction !== opening || session?.repoId !== current.repoId) return;
       historyConfirmSummary = details.summary;
       historyConfirmToken = details.confirmationToken;
     } catch (e) {
-      if (session?.repoId !== current.repoId) return;
+      if (historyAction !== opening || session?.repoId !== current.repoId) return;
       historyActionError = e as AppError;
     } finally {
-      historyActionBusy = false;
+      if (historyAction === opening) historyActionBusy = false;
     }
   }
 
   function closeHistoryAction(): void {
     historyAction = null;
+    historyMessage = null;
+    historyActionBusy = false;
     historyActionError = null;
     historyConfirmSummary = null;
     historyConfirmToken = null;
@@ -1823,15 +2119,17 @@
       case "checkout": {
         // Remote checkout without a local twin creates a tracking branch
         // (`git switch -c`); a twin checks out directly. Dirty worktrees go
-        // through the stash offer inside switchBranch.
+        // through the stash offer inside switchBranch. Remote checkouts pull
+        // right after the switch so local and origin land together.
         const target = resolveCheckoutTarget(refs, ref);
-        await switchBranch(target.refId, target.trackAs);
+        const pullAfter = shouldPullAfterCheckout(ref, session.trust === "trusted");
+        const switched = await switchBranch(target.refId, target.trackAs, pullAfter);
+        if (switched && pullAfter) await startSyncJob("pull");
         return;
       }
       case "merge":
-        mergeError = null;
         mergeSource = ref.refId;
-        showMerge = true;
+        await startMerge(ref.refId, true);
         return;
       case "create-branch":
         openBranchesAt(ref.oid);
@@ -2035,6 +2333,7 @@
     if (!session || !historyAction || historyActionBusy) return;
     const current = session;
     const { action, row } = historyAction;
+    if (action === "reword" && !historyMessage) return;
     const adapter = statusAdapter();
     historyActionBusy = true;
     historyActionError = null;
@@ -2191,6 +2490,7 @@
     const current = session;
     const target = stashSwitch;
     stashSwitchBusy = true;
+    if (target.kind === "branch") branchBusyRef = target.refId;
     stashSwitchError = null;
     try {
       const stash = await statusAdapter().stashSave(
@@ -2221,6 +2521,7 @@
         : `Switched to ${target.label}. Changes stashed — restore them from Stashes when ready.`;
       clearDiff();
       await reloadAfterMutation();
+      if (target.kind === "branch" && target.pullAfter) await startSyncJob("pull");
     } catch (e) {
       if (session === null || session.repoId !== current.repoId) return;
       stashSwitchError = e as AppError;
@@ -2234,38 +2535,48 @@
       await loadStatus();
       await loadHistory(true);
     } finally {
-      if (session?.repoId === current.repoId) stashSwitchBusy = false;
+      if (session?.repoId === current.repoId) {
+        stashSwitchBusy = false;
+        branchBusyRef = null;
+      }
     }
   }
 
-  async function switchBranch(refId: string, trackAs: string | null = null): Promise<void> {
-    if (!session || branchBusy) return;
+  /** Branch row showing the checkout spinner (right side) during a switch. */
+  let branchBusyRef: string | null = $state(null);
+
+  async function switchBranch(refId: string, trackAs: string | null = null, pullAfter = false): Promise<boolean> {
+    if (!session || branchBusy) return false;
     const current = session;
     if (shouldOfferStash()) {
       const target = refs.find((r) => r.refId === refId);
-      openStashSwitch({ kind: "branch", refId, label: target?.label ?? refId, trackName: trackAs });
-      return;
+      openStashSwitch({ kind: "branch", refId, label: target?.label ?? refId, trackName: trackAs, pullAfter });
+      return false;
     }
     branchBusy = true;
+    branchBusyRef = refId;
     branchError = null;
     try {
       session = await statusAdapter().branchSwitch(current.repoId, current.version, refId, trackAs);
-      if (session === null || session.repoId !== current.repoId) return;
+      if (session === null || session.repoId !== current.repoId) return false;
       await reloadAfterMutation();
+      return true;
     } catch (e) {
-      if (session === null || session.repoId !== current.repoId) return;
+      if (session === null || session.repoId !== current.repoId) return false;
       branchError = e as AppError;
       await loadStatus();
+      return false;
     } finally {
-      if (session?.repoId === current.repoId) branchBusy = false;
+      if (session?.repoId === current.repoId) {
+        branchBusy = false;
+        branchBusyRef = null;
+      }
     }
   }
 
-  async function trackBranch(refId: string): Promise<void> {
-    if (!session || branchBusy || trackName.trim() === "") return;
-    const name = trackName.trim();
-    await switchBranch(refId, name);
-    if (session && !stashSwitch && !branchError) trackName = "";
+  async function trackBranch(refId: string, name: string): Promise<void> {
+    if (!session || branchBusy || name.trim() === "") return;
+    await switchBranch(refId, name.trim());
   }
 
   async function askDeleteBranch(refId: string): Promise<void> {
@@ -2309,6 +2620,14 @@
       );
       if (session === null || session.repoId !== current.repoId) return;
       deleteConfirm = null;
+      // A history scope pinned to the deleted ref would fail reload with
+      // REF_INVALID ("Unknown ref"); fall back to all refs first.
+      const nextScope = scopeAfterRefDelete(scope, target.refId);
+      if (nextScope !== scope) {
+        scope = nextScope;
+        scopeValue = "all";
+      }
+      if (selectedRefId === target.refId) selectedRefId = null;
       await reloadAfterMutation();
     } catch (e) {
       if (session === null || session.repoId !== current.repoId) return;
@@ -2370,6 +2689,11 @@
   }
 
   async function refreshAll(): Promise<void> {
+    if (amendNeedsValidation) {
+      await refreshActivatedRepository();
+      await loadPreflight();
+      return;
+    }
     if (session && !demo) {
       try {
         session = await realAdapter.repoSnapshot(session.repoId, true);
@@ -2399,13 +2723,17 @@
     if (id === "working") {
       clearDiff();
       changeInspector("working");
+    } else if (id === "stashes") {
+      void loadStashList();
     }
   }
 
   function selectRef(refId: string): void {
     const kind = refs.find((r) => r.refId === refId)?.kind;
     section = kind === "remote" ? "remote" : kind === "tag" ? "tags" : "local";
-    void applyScope(`ref:${refId}`);
+    // Highlight only: the graph keeps showing every branch. Per-branch
+    // filtering stays explicit via the scope dropdown in HistoryPane.
+    selectedRefId = refId;
   }
 
   function resizeSidebar(delta: number): void {
@@ -2481,6 +2809,7 @@
     void loadSettings();
     restoreWidths();
     void Promise.all([loadHistory(true), loadStatus(), loadRemoteStatus(), loadIdentity()]);
+    if (amendNeedsValidation) void refreshActivatedRepository(false);
     void subscribeInvalidated();
   });
   onDestroy(() => {
@@ -2497,10 +2826,13 @@
     if (active) untrack(() => { if (session && !statusLoading) void refreshActivatedRepository(); });
   });
   $effect(() => {
+    if (diff.selection) untrack(() => closeMerge());
+  });
+  $effect(() => {
     if (!session) return;
     const next: WorkspaceState = {
       snapshot: session,
-      busy: busy || indexBusy || discardBusy || commitBusy || branchBusy || syncJobActive || mergeBusy || conflictBusy !== null || stashSaveBusy || stashBusyEntry !== null,
+      busy: busy || indexBusy || discardBusy || commitBusy || amendLoading || branchBusy || syncJobActive || mergeBusy || conflictBusy !== null || stashSaveBusy || stashBusyEntry !== null,
       hasDraft: !!(shell.commitMessage.trim() || commitBody.trim()),
       changedFiles: statusFiles?.length ?? null,
       hasError: !!(sessionError || indexError || commitError || syncError || conflictActionError),
@@ -2570,7 +2902,11 @@
           onPull={() => void startSyncJob("pull")}
           onPush={() => void startSyncJob("push")}
           onMerge={openMerge}
-          onStash={openStash}
+          onStash={() => void quickStash()}
+          onPopStash={() => void quickPop()}
+          stashSaveBusy={stashSaveBusy}
+          stashPopBusy={stashBusyEntry !== null && stashBusyEntry.startsWith("pop:")}
+          stashBusy={stashSaveBusy || stashBusyEntry !== null}
           onCancel={() => void cancelSyncJob()}
           {bitbucketAvailable}
           onConnectBitbucket={openBitbucketAuth}
@@ -2642,6 +2978,18 @@
         onSelect={selectSection}
         onRefSelect={selectRef}
         onBranchAction={(action, ref) => void branchAction(action, ref)}
+        stashes={stashEntries}
+        stashesLoading={stashLoading}
+        stashesError={stashError}
+        stashesNotice={stashNotice}
+        stashBusyEntry={stashBusyEntry}
+        onStashApply={(entry) => void applyStash(entry, "apply")}
+        onStashPop={(entry) => void applyStash(entry, "pop")}
+        onStashManage={openStash}
+        onStashRetry={() => void loadStashList()}
+        mergeTarget={mergeTargetOid === null ? null : mergeTargetLabel}
+        mergeBusy={mergeBusy}
+        busyRefId={branchBusyRef}
       />
       <Splitter
         label="Resize sidebar"
@@ -2649,8 +2997,15 @@
         onReset={() => (shell.sidebarWidth = SHELL_LIMITS.sidebarDefault)}
       />
       <main class="gd-main" aria-label="Main panel">
-      <div class="gd-history-slot" hidden={diff.selection !== null}>
-      {#if workBar}
+      {#if unresolvedFiles > 0}
+        <button type="button" class="gd-conflictbar" aria-label={`${unresolvedFiles} files have conflicts. Open conflicts.`} onclick={() => { changeInspector("conflict"); void loadConflicts(); }}>
+          <span aria-hidden="true">⚠</span>
+          <strong>{unresolvedFiles} file {unresolvedFiles === 1 ? "conflict" : "conflicts"} detected</strong>
+          <span>Resolve conflicts →</span>
+        </button>
+      {/if}
+      <div class="gd-history-slot" hidden={diff.selection !== null || mergeDoc !== null || mergeLoading || mergeHunksError !== null}>
+      {#if workBar && unresolvedFiles === 0}
         <button
           type="button"
           class="gd-workbar"
@@ -2709,6 +3064,8 @@
         onLoadMore={() => void loadHistory(false)}
         branchActionsDisabled={busy || branchBusy || session?.trust !== "trusted"}
         onBranchAction={(action, ref) => void branchAction(action, ref)}
+        mergeTarget={mergeTargetOid === null ? null : mergeTargetLabel}
+        mergeBusy={mergeBusy}
       />
       </div>
       {#if diff.selection}
@@ -2727,6 +3084,33 @@
             {linesMutable}
             onStageLines={(hunkId, lines) => void stageLines(hunkId, lines)}
             onUnstageLines={(hunkId, lines) => void unstageLines(hunkId, lines)}
+          />
+        {/key}
+      {:else if mergeDoc || mergeLoading || mergeHunksError}
+        {#key mergeDoc?.pathId ?? "merge-loading"}
+          <ConflictMergePane
+            doc={mergeDoc}
+            loading={mergeLoading}
+            error={mergeHunksError}
+            picks={mergePicks}
+            manualText={mergeManualText}
+            onEdit={(text) => { mergeManualText = text; mergeNotice = null; }}
+            applying={mergeApplying}
+            autoResolving={mergeAutoResolving}
+            onAutoResolve={() => void autoResolveMerge()}
+            applyDisabled={session?.trust !== "trusted" || mergeHunksError !== null}
+            applyDisabledReason="Trust this repository to resolve conflicts"
+            applyError={mergeApplyError}
+            notice={mergeNotice}
+            onTakeSide={mergeTakeSide}
+            onToggleLine={mergeToggleLine}
+            onClearBlock={mergeClearBlock}
+            onApply={() => void applyMerge()}
+            onRetry={() => {
+              const id = mergeDoc?.pathId ?? conflictSelected;
+              if (id) void loadMergeHunks(id, true);
+            }}
+            onClose={() => closeMerge()}
           />
         {/key}
       {/if}
@@ -2750,7 +3134,7 @@
         {statusLoading}
         {statusError}
         trustBlocked={session.trust === "readOnly"}
-        onRefreshStatus={() => void loadStatus()}
+        onRefreshStatus={() => void (amendNeedsValidation ? refreshActivatedRepository() : loadStatus())}
         selectedDiffTarget={diff.selection?.target ?? null}
         onWorktreeDiff={loadWorktreeDiff}
         onCommitDiff={loadCommitDiff}
@@ -2763,11 +3147,16 @@
         {commitBody}
         {commitBusy}
         {commitError}
+        {amendOid}
+        {amendLoading}
+        {amendUnavailable}
+        {amendStale}
+        onAmend={(enabled) => void toggleAmend(enabled)}
         {identityLabel}
         headDetached={session.head.kind === "detached"}
         onCommitBody={(value) => (commitBody = value)}
         onCommit={() => void commitSelected()}
-        onStateChange={changeInspector}
+        onStateChange={(state) => { changeInspector(state); if (state === "conflict") void loadConflicts(); }}
         onCommitMessage={(value) => (shell.commitMessage = value)}
         onParentChange={(parentIndex) => {
           // Parent switch re-issues every file token: drop the old diff.
@@ -2785,7 +3174,7 @@
         conflictPreview={conflictPreview}
         {conflictPreviewLoading}
         {conflictPreviewError}
-        conflictBusy={conflictBusy}
+        conflictBusy={mergeApplying ? "saving" : mergeAutoResolving ? "auto-resolving" : conflictBusy}
         {conflictActionError}
         {conflictNotice}
         {mergeSubject}
@@ -2838,14 +3227,14 @@
   {#if active && showBranches && session}
     <BranchModal
       localRefs={refs.filter((r) => r.kind === "local")}
-      remoteRefs={refs.filter((r) => r.kind !== "local")}
+      remoteRefs={refs.filter((r) => r.kind === "remote")}
+      initialTab={branchesInitialTab}
       startOidShort={branchStartOid
         ? branchStartOid.slice(0, 12)
         : session.head.kind === "unborn" ? null : session.head.oid.slice(0, 12)}
       startSource={branchStartOid ? "commit" : "HEAD"}
       newName={newBranchName}
       switchAfter={switchAfterCreate}
-      {trackName}
       busy={branchBusy}
       error={branchError}
       deleteConfirm={deleteConfirm
@@ -2853,35 +3242,33 @@
         : null}
       onName={(value) => (newBranchName = value)}
       onSwitchAfter={(value) => (switchAfterCreate = value)}
-      onTrackName={(value) => (trackName = value)}
       onCreate={() => void createBranch()}
       onSwitch={(refId) => void switchBranch(refId)}
       onAskDelete={(refId) => void askDeleteBranch(refId)}
       onConfirmDelete={() => void confirmDeleteBranch()}
       onCancelDelete={() => (deleteConfirm = null)}
-      onTrack={(refId) => {
-        const target = refs.find((r) => r.refId === refId);
-        if (target && trackName.trim() === "") {
-          trackName = target.label.includes("/") ? target.label.split("/").slice(1).join("/") : target.label;
-        }
-        void trackBranch(refId);
-      }}
+      onTrack={(refId, name) => void trackBranch(refId, name)}
       onClose={closeBranches}
     />
   {/if}
   {#if active && historyAction && session}
+    {#key historyAction}
     <CommitActionModal
       action={historyAction.action}
       oid={historyAction.row.oid}
       subject={historyAction.row.subject}
       isHead={historyActionHead(historyAction.row.oid)}
       busy={historyActionBusy}
+      initialValues={historyMessage}
+      loading={historyAction.action === "reword" && historyActionBusy && !historyMessage}
+      ready={historyAction.action !== "reword" || historyMessage !== null}
       error={historyActionError}
       confirmSummary={historyConfirmSummary}
       planRows={historyPlanRows}
       onSubmit={(values, plan) => void submitHistoryAction(values, plan)}
       onClose={closeHistoryAction}
     />
+    {/key}
   {/if}
   {#if active && stashSwitch && session}
     <StashSwitchModal
@@ -2954,7 +3341,7 @@
             ? "No other branch to merge from"
             : `Merge into ${mergeTargetLabel} with a review stop`}
       onSelectSource={(value) => (mergeSource = value)}
-      onStart={() => void startMerge()}
+      onStart={() => void startMerge(mergeSource, false)}
       onClose={() => (showMerge = false)}
     />
   {/if}
@@ -3002,7 +3389,7 @@
       saveDisabledReason={syncDisabled ? syncDisabledReason : null}
       onMessage={(value) => (stashMessage = value)}
       onIncludeUntracked={(value) => (stashIncludeUntracked = value)}
-      onSave={() => void saveStash()}
+      onSave={() => void saveStash(stashMessage, stashIncludeUntracked)}
       onApply={(entry) => void applyStash(entry, "apply")}
       onPop={(entry) => void applyStash(entry, "pop")}
       onClose={closeStash}
@@ -3029,12 +3416,18 @@
   }
   .gd-main {
     flex: 1 1 0;
+    display: flex;
+    flex-direction: column;
     min-width: 0;
     min-height: 0;
     overflow: hidden;
   }
-  .gd-history-slot { display: flex; flex-direction: column; height: 100%; }
+  .gd-history-slot { display: flex; flex-direction: column; flex: 1; min-height: 0; }
   .gd-history-slot[hidden] { display: none; }
+  .gd-conflictbar { display: flex; align-items: center; gap: 8px; flex-shrink: 0; width: 100%; min-height: 34px; padding: 6px 12px; background: var(--gd-warning); color: #302411; border: 0; border-bottom: 1px solid #b48b39; text-align: left; cursor: pointer; font: var(--gd-font-size) var(--gd-font-ui); }
+  .gd-conflictbar > span:last-child { margin-left: auto; font-size: var(--gd-font-size-small); }
+  .gd-conflictbar:hover { filter: brightness(1.06); }
+  .gd-conflictbar:focus-visible { outline: 2px solid var(--gd-focus); outline-offset: -2px; }
   .gd-workbar {
     display: flex;
     align-items: center;

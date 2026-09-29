@@ -31,6 +31,10 @@ export interface BranchMenuContext {
   actionsDisabled: boolean;
   /** Selected graph commit; move targets it. Null disables move. */
   selectedCommitOid: string | null;
+  /** Merge target label ("main", "detached a1b2c3d4"). Null disables merge. */
+  mergeTarget: string | null;
+  /** A merge is already running; the merge entry waits for it. */
+  mergeBusy: boolean;
 }
 
 function copyItems(
@@ -84,6 +88,35 @@ export function resolveCheckoutTarget(refs: RefItem[], ref: RefItem): CheckoutTa
   return { refId: ref.refId, trackAs: name };
 }
 
+/**
+ * Whether double-clicking `ref` checks it out. Local and remote branch
+ * rows switch to that branch; tags have no checkout and stay put.
+ */
+export function canCheckoutRef(ref: RefItem): boolean {
+  return ref.kind === "local" || ref.kind === "remote";
+}
+
+/**
+ * Whether checking out `ref` should pull right after the switch so the
+ * local branch lands on the latest remote state. Only trusted checkouts of
+ * real remote branches qualify: local rows, tags, untrusted repositories,
+ * and the `origin/HEAD` symref (which has no branch of its own) never do.
+ */
+export function shouldPullAfterCheckout(ref: RefItem, trusted: boolean): boolean {
+  if (ref.kind !== "remote" || !trusted) return false;
+  return suggestedTrackName(ref.label) !== "HEAD";
+}
+
+/**
+ * Opening tab of the Branches dialog. The "create here" flows arrive with an
+ * explicit start commit and land on the form; plain browsing lands on the
+ * local rows. The dialog's own start-commit display still falls back to HEAD
+ * when browsing, so callers must pass their own opener intent here.
+ */
+export function defaultBranchTab(createHere: boolean): "create" | "local" {
+  return createHere ? "create" : "local";
+}
+
 export function buildBranchMenuItems(
   ref: RefItem,
   ctx: BranchMenuContext,
@@ -119,8 +152,18 @@ export function buildBranchMenuItems(
         },
     {
       id: "merge",
-      label: `Merge into current: ${ref.label}`,
-      disabled: locked,
+      label:
+        ctx.mergeTarget === null
+          ? `Merge into current: ${ref.label}`
+          : `Merge ${ref.label} into ${ctx.mergeTarget}`,
+      disabled: locked || ctx.mergeBusy || ref.current || ctx.mergeTarget === null,
+      title: ref.current
+        ? "Already the current branch"
+        : ctx.mergeBusy
+          ? "A merge is already running"
+          : ctx.mergeTarget === null
+            ? "No commits yet"
+            : undefined,
       action: go("merge")
     },
     {

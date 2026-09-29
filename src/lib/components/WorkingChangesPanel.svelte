@@ -10,18 +10,21 @@
 
   let { branchName, files, loading, error, trustBlocked, selectedTarget, indexBusy, indexError,
     subject, body, commitBusy, commitError, identityLabel, headDetached, onRefresh, onOpen,
+    amendOid, amendLoading, amendUnavailable, amendStale, onAmend,
     onStage, onUnstage, onDiscard, onDiscardAll, onSubject, onBody, onCommit, onConflicts }: {
     branchName: string; files: ChangedFile[] | null; loading: boolean; error: AppError | null; trustBlocked: boolean;
     selectedTarget: DiffTarget | null; indexBusy: boolean; indexError: AppError | null;
     subject: string; body: string; commitBusy: boolean; commitError: AppError | null; identityLabel: string | null; headDetached: boolean;
+    amendOid: string | null; amendLoading: boolean; amendUnavailable: string | null; amendStale: boolean;
+    onAmend: (enabled: boolean) => void;
     onRefresh: () => void; onOpen: (id: string, side: FileSide, path: string) => void;
     onStage: (ids: string[]) => void; onUnstage: (ids: string[]) => void; onDiscard: (id: string) => void; onDiscardAll: () => void; onSubject: (value: string) => void; onBody: (value: string) => void; onCommit: () => void; onConflicts: () => void;
   } = $props();
   const changes = $derived(partitionStatus((files ?? []).filter(f => !f.conflicted)));
   const conflicts = $derived((files ?? []).filter(f => f.conflicted));
   const disabled = $derived(trustBlocked || indexBusy || commitBusy || loading || files === null);
-  const commitHint = $derived(trustBlocked ? "Trust this repository to commit." : conflicts.length ? "Resolve conflicts before committing." : files === null ? "Load working changes first." : changes.staged.length === 0 ? "Stage a file to include it in your commit." : !subject.trim() ? "Write a summary for this commit." : `${changes.staged.length} staged ${changes.staged.length === 1 ? "file" : "files"} will be committed.`);
-  const canCommit = $derived(!disabled && !conflicts.length && changes.staged.length > 0 && subject.trim() !== "");
+  const commitHint = $derived(trustBlocked ? "Trust this repository to commit." : conflicts.length ? "Resolve conflicts before committing." : files === null ? "Load working changes first." : amendStale ? "HEAD changed or is not verified. Refresh or turn Amend off before continuing." : changes.staged.length === 0 && !amendOid ? "Stage a file to include it in your commit." : !subject.trim() ? "Write a summary for this commit." : amendOid ? `Replace commit ${amendOid.slice(0, 7)} with this message and the staged changes.` : `${changes.staged.length} staged ${changes.staged.length === 1 ? "file" : "files"} will be committed.`);
+  const canCommit = $derived(!disabled && !amendLoading && !amendStale && !error && !conflicts.length && (changes.staged.length > 0 || amendOid !== null) && subject.trim() !== "");
   let fileMenu = $state<{ file: ChangedFile; side: FileSide; x: number; y: number } | null>(null);
   function commitKey(event: KeyboardEvent) {
     if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
@@ -137,21 +140,33 @@
   {#if headDetached}<p class="gd-notice">Detached HEAD. Create a branch to keep your next commit reachable.</p>{/if}
 </div>
 <footer class="gd-commit-editor">
-  <div class="gd-editor-heading"><h3>Create commit</h3><span>Staged files only</span></div>
+  <div class="gd-editor-heading"><h3>{amendOid ? "Amend commit" : "Create commit"}</h3><span>Staged files only</span></div>
+  <label class="gd-amend-toggle" title={amendUnavailable ?? "Replace the latest commit with your staged changes and message"}>
+    <input type="checkbox" checked={amendOid !== null} disabled={disabled || amendLoading || (!amendOid && (!!amendUnavailable || !!conflicts.length))} onchange={e => {
+      const enabled = e.currentTarget.checked;
+      // The mode changes only after HEAD loads successfully.
+      e.currentTarget.checked = amendOid !== null;
+      onAmend(enabled);
+    }} />
+    Amend last commit
+  </label>
+  {#if amendLoading}<p class="gd-commit-hint" role="status">Loading last commit…</p>
+  {:else if amendUnavailable}<p class="gd-commit-hint">{amendUnavailable}</p>{/if}
   <label for={summaryId}>Summary</label>
-  <input id={summaryId} aria-label="Commit subject" placeholder="What changed?" value={subject} maxlength="500" oninput={e => onSubject(e.currentTarget.value)} onkeydown={commitKey} />
+  <input id={summaryId} aria-label="Commit subject" placeholder="What changed?" value={subject} maxlength="500" disabled={commitBusy || amendLoading} oninput={e => onSubject(e.currentTarget.value)} onkeydown={commitKey} />
   <details open={body !== ""}><summary>Add description <span>optional</span></summary>
-    <textarea aria-label="Commit body" placeholder="Why was this change needed?" value={body} rows="3" oninput={e => onBody(e.currentTarget.value)} onkeydown={commitKey}></textarea>
+    <textarea aria-label="Commit body" placeholder="Why was this change needed?" value={body} rows="3" disabled={commitBusy || amendLoading} oninput={e => onBody(e.currentTarget.value)} onkeydown={commitKey}></textarea>
   </details>
-  {#if identityLabel}<p class="gd-identity" title={identityLabel}>{identityLabel}</p>{/if}
+  {#if amendOid}<p class="gd-identity">Original author is preserved.</p>
+  {:else if identityLabel}<p class="gd-identity" title={identityLabel}>{identityLabel}</p>{/if}
   {#if commitError}<p class="gd-error" role="alert">{commitError.message} Your draft is saved.</p>{/if}
-  <button class="gd-commit-button" disabled={!canCommit} title={commitHint} onclick={onCommit}>{commitBusy ? "Committing…" : `Commit ${changes.staged.length} ${changes.staged.length === 1 ? "file" : "files"}`}<span>⌃ ↵</span></button>
+  <button class="gd-commit-button" disabled={!canCommit} title={commitHint} onclick={onCommit}>{commitBusy ? (amendOid ? "Amending…" : "Committing…") : amendOid ? "Amend last commit" : `Commit ${changes.staged.length} ${changes.staged.length === 1 ? "file" : "files"}`}<span>⌃ ↵</span></button>
 </footer>
 {#if fileMenu}<ContextMenu x={fileMenu.x} y={fileMenu.y} items={fileMenuItems(fileMenu.file, fileMenu.side)}
   label={`File actions for ${fileMenu.file.displayPath}`} onClose={() => (fileMenu = null)} />{/if}
 
 <style>
-  .gd-work-content { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 8px 12px; }
+  .gd-work-content { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 8px 0 8px; }
   .gd-status-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 38px; margin-bottom: 14px; padding: 4px 4px 10px; border-bottom: 1px solid var(--gd-border); }
   .gd-refresh { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; height: 28px; padding: 0 8px; border: 1px solid var(--gd-border); background: transparent; color: var(--gd-text-secondary); border-radius: 4px; cursor: pointer; font: 11px var(--gd-font-ui); }
   .gd-refresh:not(:disabled):hover { color: var(--gd-text); background: var(--gd-surface-hover); border-color: color-mix(in srgb, var(--gd-border) 60%, var(--gd-text-secondary)); }
@@ -159,14 +174,13 @@
   .gd-work-summary strong { color: var(--gd-text); font-size: 12px; font-weight: 620; }
   .gd-work-summary span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .gd-work-summary em { color: var(--gd-accent); font-style: normal; }
-  .gd-file-group { margin-bottom: 14px; }
   .gd-group-heading { display: flex; align-items: center; justify-content: space-between; padding: 0 4px 8px; border-bottom: 1px solid var(--gd-border); margin-bottom: 4px; }
   .gd-group-toggle { display: flex; align-items: center; gap: 6px; margin: 0; padding: 2px 4px; background: transparent; border: 0; border-radius: 4px; cursor: pointer; color: var(--gd-text); font-size: 12px; font-weight: 600; }
   .gd-group-toggle:focus-visible { outline: 2px solid var(--gd-focus); outline-offset: 1px; }
   .gd-chevron { display: inline-block; width: 1.4ch; color: var(--gd-text-secondary); font-weight: 400; }
   .gd-group-title .gd-count { margin-left: 7px; padding: 1px 5px; background: var(--gd-surface-raised); color: var(--gd-text-secondary); border-radius: 3px; font-size: 10px; font-weight: 400; }
   .gd-editor-heading h3 { margin: 0; font-size: 12px; font-weight: 600; }
-  .gd-group-list { height: 220px; overflow-y: auto; overflow-x: hidden; }
+  .gd-group-list { height: 248px; overflow-y: auto; overflow-x: hidden; }
   ul { list-style: none; padding: 0; margin: 0; }
   .gd-group-actions { display: flex; align-items: center; gap: 8px; }
   .gd-text-action { border: 0; padding: 3px 4px; background: transparent; color: var(--gd-accent); font-size: 11px; cursor: pointer; }
@@ -183,6 +197,9 @@
   .gd-editor-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
   .gd-editor-heading>span, .gd-commit-hint { color: var(--gd-text-secondary); font-size: 10px; }
   label { display: block; color: var(--gd-text-secondary); font-size: 11px; margin-bottom: 6px; }
+  .gd-amend-toggle { display: flex; align-items: center; gap: 7px; margin-bottom: 10px; color: var(--gd-text); cursor: pointer; }
+  .gd-amend-toggle input { width: auto; margin: 0; accent-color: var(--gd-accent); }
+  .gd-amend-notice { color: var(--gd-warning); font-size: 11px; line-height: 1.4; margin: 0 0 10px; }
   input, textarea { width: 100%; background: var(--gd-canvas); color: var(--gd-text); border: 1px solid var(--gd-border); border-radius: 4px; padding: 7px 8px; font: var(--gd-font-size-small)/1.4 var(--gd-font-ui); }
   textarea { resize: vertical; min-height: 64px; max-height: 140px; margin-top: 8px; }
   details { margin-top: 10px; font-size: 11px; color: var(--gd-text-secondary); }

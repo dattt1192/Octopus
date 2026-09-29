@@ -46,6 +46,11 @@
     commitBody: string;
     commitBusy: boolean;
     commitError: AppError | null;
+    amendOid: string | null;
+    amendLoading: boolean;
+    amendUnavailable: string | null;
+    amendStale: boolean;
+    onAmend: (enabled: boolean) => void;
     identityLabel: string | null;
     headDetached: boolean;
     onCommitBody: (value: string) => void;
@@ -114,6 +119,11 @@
     commitBody,
     commitBusy,
     commitError,
+    amendOid,
+    amendLoading,
+    amendUnavailable,
+    amendStale,
+    onAmend,
     identityLabel,
     headDetached,
     onCommitBody,
@@ -161,6 +171,7 @@
     <WorkingChangesPanel {branchName} files={statusFiles} loading={statusLoading} error={statusError} {trustBlocked}
       selectedTarget={selectedDiffTarget} {indexBusy} {indexError} subject={commitMessage} body={commitBody}
       {commitBusy} {commitError} {identityLabel} {headDetached} onRefresh={onRefreshStatus}
+      {amendOid} {amendLoading} {amendUnavailable} {amendStale} {onAmend}
       onOpen={onWorktreeDiff} onStage={onStageFiles} onUnstage={onUnstageFiles} onSubject={onCommitMessage}
       onDiscard={onDiscardFile} onDiscardAll={onDiscardAllFiles}
       onBody={onCommitBody} {onCommit} onConflicts={() => onStateChange("conflict")} />

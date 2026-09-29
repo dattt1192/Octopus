@@ -2,6 +2,8 @@
   // Conflict inspector panel (T13): file list, base/current/incoming
   // preview, whole-file accept behind confirmation, mark resolved
   // (working file or confirmed deletion), complete and abort.
+  import FileChangeRow from "./FileChangeRow.svelte";
+  import { neighborRowIndex } from "./file-row-nav";
   import type { AppError, ConflictFile, ConflictPreview } from "../ipc/types";
 
   interface AcceptConfirm {
@@ -79,6 +81,19 @@
     onCancelAbort
   }: Props = $props();
 
+  let collapsed = $state(false);
+  function fileListKey(event: KeyboardEvent): void {
+    const list = event.currentTarget as HTMLElement;
+    const rows = [...list.querySelectorAll<HTMLButtonElement>(".gd-file")];
+    const current = rows.indexOf(event.target as HTMLButtonElement);
+    if (current < 0) return;
+    const next = neighborRowIndex(rows.length, current, event.key);
+    if (next === null) return;
+    event.preventDefault();
+    rows[next].focus();
+    rows[next].click();
+  }
+
   function errorText(e: AppError): string {
     return `${e.code}: ${e.message}`;
   }
@@ -95,9 +110,10 @@
 </script>
 
 <div class="gd-inspector-body">
-  {#if mergeBanner}
-    <p class="gd-banner" role="alert">{mergeBanner}</p>
-  {/if}
+  <div class="gd-conflict-heading"><span aria-hidden="true">⚠</span><strong>{files.length ? "Merge conflicts detected" : "Conflict resolution"}</strong></div>
+  {#if preview}
+    <p class="gd-merging">Merging <span>{preview.incomingLabel}</span> into <span>{preview.currentLabel}</span></p>
+  {:else if mergeBanner}<p class="gd-banner">{mergeBanner}</p>{/if}
   {#if actionError}
     <p class="gd-error" role="alert">{errorText(actionError)}</p>
   {/if}
@@ -106,8 +122,8 @@
   {/if}
 
   <div class="gd-work-head">
-    <h2>Conflicts ({files.length})</h2>
-    <button type="button" class="gd-back" onclick={onReload} disabled={filesLoading} title="Re-read the unmerged index">
+    <button class="gd-group-toggle" aria-expanded={!collapsed} onclick={() => collapsed = !collapsed}><span aria-hidden="true">{collapsed ? "▸" : "▾"}</span> Conflicted Files <span class="gd-count">{files.length}</span></button>
+    <button type="button" class="gd-back" onclick={onReload} disabled={filesLoading || busy !== null} title="Re-read the unmerged index">
       {filesLoading ? "Loading…" : "Refresh"}
     </button>
   </div>
@@ -124,22 +140,14 @@
       {/if}
     </p>
   {:else}
-    <ul class="gd-conflict-list">
-      {#each files as file (file.pathId)}
-        <li>
-          <button
-            type="button"
-            class="gd-file"
-            class:selected={selectedPathId === file.pathId}
-            onclick={() => onSelectFile(file.pathId)}
-          >
-            {file.displayPath}
-            <span class="gd-muted"> · {kindLabel(file.kind)}</span>
-            {#if !file.supported}<span class="gd-muted"> · external</span>{/if}
-          </button>
-        </li>
-      {/each}
-    </ul>
+    {#if !collapsed}
+      <!-- svelte-ignore a11y_no_noninteractive_element_interactions: delegates navigation between existing file buttons -->
+      <ul class="gd-conflict-list" aria-label="Conflicted files" onkeydown={fileListKey}>
+        {#each files as file (file.pathId)}
+          <FileChangeRow path={file.displayPath} status="U" selected={selectedPathId === file.pathId} onOpen={() => onSelectFile(file.pathId)} />
+        {/each}
+      </ul>
+    {/if}
   {/if}
 
   {#if previewLoading}
@@ -148,23 +156,10 @@
     <p class="gd-error" role="alert">{errorText(previewError)}</p>
   {:else if preview}
     <section aria-label="Conflict preview">
-      <h3>{preview.displayPath}</h3>
+      <h3 class="gd-selected-path" title={preview.displayPath}>{preview.displayPath}</h3>
+      <p class="gd-muted">{kindLabel(files.find((file) => file.pathId === selectedPathId)?.kind ?? "unknown")}</p>
       {#if !preview.supportedActions.length && preview.supportReason}
         <p class="gd-muted">{preview.supportReason}</p>
-      {/if}
-      {#if preview.base}
-        <h4>Base</h4>
-        <pre class="gd-stage">{preview.base.text}{#if preview.base.truncated}<span class="gd-muted">(truncated)</span>{/if}</pre>
-      {:else}
-        <p class="gd-muted">No base (added on one or both sides).</p>
-      {/if}
-      {#if preview.current}
-        <h4>Current ({preview.currentLabel})</h4>
-        <pre class="gd-stage">{preview.current.text}{#if preview.current.truncated}<span class="gd-muted">(truncated)</span>{/if}</pre>
-      {/if}
-      {#if preview.incoming}
-        <h4>Incoming ({preview.incomingLabel})</h4>
-        <pre class="gd-stage">{preview.incoming.text}{#if preview.incoming.truncated}<span class="gd-muted">(truncated)</span>{/if}</pre>
       {/if}
       {#if preview.supportedActions.length > 0}
         <div class="gd-conflict-actions">
@@ -262,21 +257,13 @@
   .gd-inspector-body {
     flex: 1 1 auto;
     overflow-y: auto;
-    padding: var(--gd-space-3);
-  }
-  .gd-inspector-body h2 {
-    margin: 0 0 var(--gd-space-2);
-    font-size: var(--gd-font-size-title);
+    padding: 8px;
   }
   .gd-inspector-body h3 {
     margin: var(--gd-space-3) 0 var(--gd-space-1);
     font-size: 13px;
   }
-  .gd-inspector-body h4 {
-    margin: var(--gd-space-2) 0 4px;
-    font-size: var(--gd-font-size-small);
-    color: var(--gd-text-secondary);
-  }
+
   .gd-banner {
     background: var(--gd-surface-raised);
     border: 1px solid var(--gd-border);
@@ -304,31 +291,13 @@
   }
   .gd-conflict-list {
     list-style: none;
-    margin: 0;
+    margin: 4px 0 12px;
     padding: 0;
+    max-height: 250px;
+    min-height: 100px;
+    overflow-y: auto;
   }
-  .gd-file {
-    background: transparent;
-    border: none;
-    color: var(--gd-text);
-    cursor: pointer;
-    padding: 4px 0;
-    text-align: left;
-  }
-  .gd-file.selected {
-    font-weight: bold;
-  }
-  .gd-stage {
-    background: var(--gd-canvas);
-    border: 1px solid var(--gd-border);
-    border-radius: var(--gd-radius-control);
-    padding: var(--gd-space-2);
-    max-height: 180px;
-    overflow: auto;
-    white-space: pre-wrap;
-    word-break: break-word;
-    font-size: var(--gd-font-size-small);
-  }
+
   .gd-conflict-actions {
     display: flex;
     gap: var(--gd-space-2);
@@ -357,7 +326,15 @@
     color: var(--gd-text);
     padding: 6px 8px;
   }
-  .gd-back {
-    margin-top: var(--gd-space-2);
-  }
+  .gd-conflict-heading { display: flex; justify-content: center; gap: 8px; padding: 10px 4px; color: var(--gd-warning); border-bottom: 1px solid var(--gd-border); }
+  .gd-merging { text-align: center; font-size: var(--gd-font-size-small); color: var(--gd-text-secondary); padding: 10px 0; }
+  .gd-merging span { padding: 2px 5px; background: var(--gd-surface-raised); border-radius: 3px; color: var(--gd-focus); }
+  .gd-work-head { padding: 6px 4px; border-bottom: 1px solid var(--gd-border); }
+  .gd-group-toggle { display: flex; align-items: center; gap: 6px; border: 0; background: transparent; padding: 0; font: 600 12px var(--gd-font-ui); color: var(--gd-text); cursor: pointer; }
+  .gd-count { border-radius: 3px; padding: 1px 5px; background: var(--gd-surface-raised); color: var(--gd-text-secondary); font-size: 10px; }
+  .gd-selected-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  button { padding: 5px 8px; background: transparent; border: 1px solid var(--gd-border); border-radius: 4px; color: var(--gd-text); cursor: pointer; font-size: var(--gd-font-size-small); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button:hover:not(:disabled) { background: var(--gd-surface-hover); }
+  button:focus-visible { outline: 2px solid var(--gd-focus); }
 </style>

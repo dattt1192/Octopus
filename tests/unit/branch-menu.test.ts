@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { buildBranchMenuItems, pullRequestTargetName, resolveCheckoutTarget } from "../../src/lib/refs/branch-menu";
+import { buildBranchMenuItems, canCheckoutRef, defaultBranchTab, pullRequestTargetName, resolveCheckoutTarget, shouldPullAfterCheckout } from "../../src/lib/refs/branch-menu";
 import type { RefItem } from "../../src/lib/ipc/types";
 
 function ref(overrides: Partial<RefItem> = {}): RefItem {
@@ -15,7 +15,7 @@ function ref(overrides: Partial<RefItem> = {}): RefItem {
   };
 }
 
-const ctx = { actionsDisabled: false, selectedCommitOid: "bbb" };
+const ctx = { actionsDisabled: false, selectedCommitOid: "bbb", mergeTarget: "main", mergeBusy: false };
 
 describe("branch context menu", () => {
   it("orders local items like the requested desktop menu", () => {
@@ -108,6 +108,24 @@ describe("branch context menu", () => {
     expect(ids).toContain("checkout");
   });
 
+  it("names both branches on the merge entry", () => {
+    const items = buildBranchMenuItems(ref(), ctx, vi.fn(), vi.fn());
+    const merge = items.find((item) => item.id === "merge");
+    expect(merge?.label).toBe("Merge feature into main");
+    expect(merge?.disabled).toBe(false);
+  });
+
+  it("disables merge into itself, while busy, and without a target", () => {
+    const self = buildBranchMenuItems(ref({ current: true }), ctx, vi.fn(), vi.fn());
+    expect(self.find((item) => item.id === "merge")?.disabled).toBe(true);
+    const busy = buildBranchMenuItems(ref(), { ...ctx, mergeBusy: true }, vi.fn(), vi.fn());
+    expect(busy.find((item) => item.id === "merge")?.disabled).toBe(true);
+    const noTarget = buildBranchMenuItems(ref(), { ...ctx, mergeTarget: null }, vi.fn(), vi.fn());
+    const fallback = noTarget.find((item) => item.id === "merge");
+    expect(fallback?.disabled).toBe(true);
+    expect(fallback?.label).toBe("Merge into current: feature");
+  });
+
   it("disables checkout on the current branch and move without a target", () => {
     const onAction = vi.fn();
     const current = buildBranchMenuItems(ref({ current: true }), ctx, onAction, vi.fn());
@@ -121,7 +139,7 @@ describe("branch context menu", () => {
   it("locks mutations but never copies or reveal", () => {
     const items = buildBranchMenuItems(
       ref(),
-      { actionsDisabled: true, selectedCommitOid: "bbb" },
+      { actionsDisabled: true, selectedCommitOid: "bbb", mergeTarget: "main", mergeBusy: false },
       vi.fn(),
       vi.fn()
     );
@@ -133,6 +151,12 @@ describe("branch context menu", () => {
     }
   });
 
+  it("double-click checks out branches but never tags", () => {
+    expect(canCheckoutRef(ref())).toBe(true);
+    expect(canCheckoutRef(ref({ kind: "remote" }))).toBe(true);
+    expect(canCheckoutRef(ref({ kind: "tag" }))).toBe(false);
+  });
+
   it("routes clicks to the action callback", () => {
     const onAction = vi.fn();
     const onCopy = vi.fn();
@@ -141,5 +165,23 @@ describe("branch context menu", () => {
     expect(onAction).toHaveBeenCalledWith("rename", expect.objectContaining({ label: "feature" }));
     items.find((item) => item.id === "copy-sha")?.action?.();
     expect(onCopy).toHaveBeenCalledWith("aaa");
+  });
+
+  it("pulls after checkout only for trusted remote checkouts", () => {
+    const remote = ref({ kind: "remote", refId: "refs/remotes/origin/feature", fullName: "refs/remotes/origin/feature", label: "origin/feature" });
+    expect(shouldPullAfterCheckout(remote, true)).toBe(true);
+    expect(shouldPullAfterCheckout(remote, false)).toBe(false);
+    expect(shouldPullAfterCheckout(ref(), true)).toBe(false);
+    expect(shouldPullAfterCheckout(ref({ kind: "tag" }), true)).toBe(false);
+  });
+
+  it("never auto-pulls the remote HEAD symref checkout", () => {
+    const head = ref({ kind: "remote", refId: "refs/remotes/origin/HEAD", fullName: "refs/remotes/origin/HEAD", label: "origin/HEAD" });
+    expect(shouldPullAfterCheckout(head, true)).toBe(false);
+  });
+
+  it("opens the Branches dialog on the create form only for create-here", () => {
+    expect(defaultBranchTab(true)).toBe("create");
+    expect(defaultBranchTab(false)).toBe("local");
   });
 });

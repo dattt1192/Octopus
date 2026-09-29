@@ -1,3 +1,4 @@
+pub mod auto_merge;
 pub mod commit;
 pub mod diff;
 pub mod discover;

@@ -1,6 +1,8 @@
 //! `merge_start` / `merge_complete` / `merge_abort` plus the conflict
 //! inspector (`conflict_list`, `conflict_preview`, `conflict_accept`,
-//! `conflict_mark_resolved`) — T13.
+//! `conflict_mark_resolved`) — T13 — and the merge editor
+//! (`conflict_hunks`, `conflict_merge`), which resolves text conflicts
+//! per block or per line from working-file markers.
 //!
 //! Merge and conflict safety rules:
 //!
@@ -43,6 +45,12 @@ use crate::services::{MergeRecord, RepoRegistry, RepoSession};
 const MAX_SUBJECT_CHARS: usize = 500;
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const PREVIEW_CAP_BYTES: usize = 32 * 1024;
+/// Merge-editor files above this resolve externally instead.
+const MERGE_CAP_BYTES: usize = 256 * 1024;
+/// Merged output above this is refused; picks reference existing lines,
+/// so legitimate output stays near input size.
+const MERGE_OUTPUT_CAP_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MERGE_PICKS: usize = 200_000;
 
 fn bad_request(message: impl Into<String>) -> AppError {
     AppError::new(
@@ -647,6 +655,648 @@ async fn core_preview(
         support_reason: if supported { None } else { Some(reason) },
         current_label,
         incoming_label,
+    })
+}
+
+/// One parsed conflict block: raw side lines (endings preserved) plus the
+/// verbatim block bytes for fail-closed identity and passthrough.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MergeBlock {
+    id: String,
+    current: Vec<Vec<u8>>,
+    incoming: Vec<Vec<u8>>,
+    base: Vec<Vec<u8>>,
+    has_base: bool,
+    raw: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MergeSegment {
+    Clean { bytes: Vec<u8> },
+    Conflict(MergeBlock),
+}
+
+/// Split keeping `\n` on each line; the last line may lack it.
+fn split_raw_lines(bytes: &[u8]) -> Vec<&[u8]> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'\n' {
+            out.push(&bytes[start..=i]);
+            start = i + 1;
+        }
+    }
+    if start < bytes.len() {
+        out.push(&bytes[start..]);
+    }
+    out
+}
+
+fn strip_eol(line: &[u8]) -> &[u8] {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+fn is_opener(s: &[u8]) -> bool {
+    s.len() >= 7 && &s[..7] == b"<<<<<<<"
+}
+
+fn is_base_sep(s: &[u8]) -> bool {
+    s.len() >= 7 && &s[..7] == b"|||||||"
+}
+
+fn is_sep(s: &[u8]) -> bool {
+    s == b"======="
+}
+
+fn is_closer(s: &[u8]) -> bool {
+    s.len() >= 7 && &s[..7] == b">>>>>>>"
+}
+
+/// Parse working-file conflict markers (`merge` and `diff3` styles) into
+/// clean regions and conflict blocks. First separator wins, matching git
+/// tooling; anything structurally malformed fails closed so the file
+/// resolves externally instead of splicing the wrong bytes.
+fn parse_merge_file(bytes: &[u8]) -> Result<Vec<MergeSegment>, AppError> {
+    #[derive(PartialEq, Eq)]
+    enum Scan {
+        Clean,
+        Current,
+        Base,
+        Incoming,
+    }
+    let malformed = || {
+        bad_request(
+            "Conflict markers are malformed; resolve this file outside the app, then mark resolved",
+        )
+    };
+    let mut segments = Vec::new();
+    let mut clean: Vec<u8> = Vec::new();
+    let mut block: Option<MergeBlock> = None;
+    let mut scan = Scan::Clean;
+    let mut saw_sep = false;
+    for line in split_raw_lines(bytes) {
+        let s = strip_eol(line);
+        if scan == Scan::Clean {
+            if is_opener(s) {
+                if !clean.is_empty() {
+                    segments.push(MergeSegment::Clean {
+                        bytes: std::mem::take(&mut clean),
+                    });
+                }
+                block = Some(MergeBlock {
+                    id: String::new(),
+                    current: Vec::new(),
+                    incoming: Vec::new(),
+                    base: Vec::new(),
+                    has_base: false,
+                    raw: Vec::new(),
+                });
+                scan = Scan::Current;
+                saw_sep = false;
+                block.as_mut().expect("block").raw.extend_from_slice(line);
+            } else {
+                clean.extend_from_slice(line);
+            }
+            continue;
+        }
+        let b = block.as_mut().expect("block");
+        b.raw.extend_from_slice(line);
+        if is_opener(s) {
+            return Err(malformed());
+        }
+        if scan == Scan::Current && is_base_sep(s) {
+            b.has_base = true;
+            scan = Scan::Base;
+        } else if (scan == Scan::Current || scan == Scan::Base) && is_sep(s) {
+            scan = Scan::Incoming;
+            saw_sep = true;
+        } else if is_closer(s) {
+            if !saw_sep {
+                return Err(malformed());
+            }
+            b.id = fingerprint(&b.raw);
+            segments.push(MergeSegment::Conflict(block.take().expect("block")));
+            scan = Scan::Clean;
+        } else {
+            match scan {
+                Scan::Current => b.current.push(line.to_vec()),
+                Scan::Base => b.base.push(line.to_vec()),
+                Scan::Incoming => b.incoming.push(line.to_vec()),
+                Scan::Clean => unreachable!("clean handled above"),
+            }
+        }
+    }
+    if scan != Scan::Clean {
+        return Err(malformed());
+    }
+    if !clean.is_empty() {
+        segments.push(MergeSegment::Clean { bytes: clean });
+    }
+    Ok(segments)
+}
+
+fn display_line(raw: &[u8]) -> String {
+    String::from_utf8_lossy(strip_eol(raw)).into_owned()
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum MergeSegmentDto {
+    Clean {
+        lines: Vec<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Conflict {
+        hunk_id: String,
+        current: Vec<String>,
+        incoming: Vec<String>,
+        base: Vec<String>,
+        raw: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictHunks {
+    pub path_id: String,
+    pub display_path: String,
+    pub current_label: String,
+    pub incoming_label: String,
+    pub working_fingerprint: String,
+    pub segments: Vec<MergeSegmentDto>,
+    pub working_text: String,
+    pub conflict_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergePickedLine {
+    pub side: String,
+    pub index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeBlockPick {
+    pub hunk_id: String,
+    pub lines: Vec<MergePickedLine>,
+}
+
+fn segment_dto(segment: &MergeSegment) -> MergeSegmentDto {
+    match segment {
+        MergeSegment::Clean { bytes } => MergeSegmentDto::Clean {
+            lines: split_raw_lines(bytes)
+                .iter()
+                .map(|l| display_line(l))
+                .collect(),
+        },
+        MergeSegment::Conflict(block) => MergeSegmentDto::Conflict {
+            hunk_id: block.id.clone(),
+            current: block.current.iter().map(|l| display_line(l)).collect(),
+            incoming: block.incoming.iter().map(|l| display_line(l)).collect(),
+            base: block.base.iter().map(|l| display_line(l)).collect(),
+            raw: String::from_utf8_lossy(&block.raw).into_owned(),
+        },
+    }
+}
+
+async fn core_hunks(
+    runner: &GitRunner,
+    registry: &RepoRegistry,
+    repo_id: &str,
+    path_id: &str,
+) -> Result<ConflictHunks, AppError> {
+    let session = registry.get(repo_id).ok_or_else(session_missing)?.clone();
+    let (raw, entry) = resolve_conflict_path(runner, registry, repo_id, &session, path_id).await?;
+    let textness = stage_textness(runner, &session, &entry).await?;
+    let (kind, supported, _) = kind_of(&entry, &textness);
+    if !supported || kind != "text" {
+        return Err(bad_request(
+            "The merge editor covers supported text conflicts only; use whole-file accept or mark resolved after an external resolution",
+        ));
+    }
+    let target = worktree_path(&session, &raw)?;
+    let working = std::fs::read(&target)
+        .map_err(|_| bad_request("Working file is missing; refresh and preview again"))?;
+    if working.len() > MERGE_CAP_BYTES {
+        return Err(bad_request(
+            "This file is too large for the merge editor; resolve it outside the app, then mark resolved",
+        ));
+    }
+    let segments = parse_merge_file(&working)?;
+    let conflict_count = segments
+        .iter()
+        .filter(|s| matches!(s, MergeSegment::Conflict(_)))
+        .count();
+    let (current_label, incoming_label) = side_labels(registry, repo_id, &session.display_name);
+    Ok(ConflictHunks {
+        path_id: path_id.to_string(),
+        display_path: String::from_utf8_lossy(&raw).into_owned(),
+        current_label,
+        incoming_label,
+        working_fingerprint: fingerprint(&working),
+        segments: segments.iter().map(segment_dto).collect(),
+        working_text: String::from_utf8(working.clone())
+            .map_err(|_| bad_request("The editor requires UTF-8 text"))?,
+        conflict_count,
+    })
+}
+
+/// Temporary merge inputs are private and never replace the working file/index.
+struct AutoMergeInputs(std::path::PathBuf);
+impl AutoMergeInputs {
+    fn new() -> Result<Self, AppError> {
+        use std::os::unix::fs::DirBuilderExt;
+        let path = std::env::temp_dir().join(format!("octopus-auto-{}", uuid::Uuid::new_v4()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .map_err(|_| git_failed())?;
+        Ok(Self(path))
+    }
+}
+impl Drop for AutoMergeInputs {
+    fn drop(&mut self) {
+        for name in ["base", "current", "incoming"] {
+            let _ = std::fs::remove_file(self.0.join(name));
+        }
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
+type BlockSides = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+type BlockBases = std::collections::HashMap<BlockSides, Option<Vec<Vec<u8>>>>;
+
+fn record_base(
+    bases: &mut BlockBases,
+    current: Vec<Vec<u8>>,
+    incoming: Vec<Vec<u8>>,
+    base: Vec<Vec<u8>>,
+) {
+    bases
+        .entry((current, incoming))
+        .and_modify(|known| {
+            if known.as_ref() != Some(&base) {
+                *known = None;
+            }
+        })
+        .or_insert(Some(base));
+}
+
+fn index_block_bases(segments: Vec<MergeSegment>) -> BlockBases {
+    let mut bases = BlockBases::new();
+    for segment in segments {
+        let MergeSegment::Conflict(mut block) = segment else {
+            continue;
+        };
+        if !block.has_base {
+            continue;
+        }
+        record_base(
+            &mut bases,
+            block.current.clone(),
+            block.incoming.clone(),
+            block.base.clone(),
+        );
+        // Merge-style markers may factor unchanged common edges out of a diff3
+        // block. Trim only edges also present in the base; never infer a base
+        // from shared additions or an ambiguous match.
+        let prefix = block
+            .base
+            .iter()
+            .zip(&block.current)
+            .zip(&block.incoming)
+            .take_while(|((base, current), incoming)| base == current && base == incoming)
+            .count();
+        block.current.drain(..prefix);
+        block.incoming.drain(..prefix);
+        block.base.drain(..prefix);
+        while !block.base.is_empty()
+            && block.current.last() == block.base.last()
+            && block.incoming.last() == block.base.last()
+        {
+            block.current.pop();
+            block.incoming.pop();
+            block.base.pop();
+        }
+        record_base(&mut bases, block.current, block.incoming, block.base);
+    }
+    bases
+}
+
+async fn read_block_bases(
+    runner: &GitRunner,
+    session: &RepoSession,
+    entry: &UnmergedEntry,
+) -> Result<BlockBases, AppError> {
+    if !(1..=3).all(|stage| entry.stages[stage].is_some()) {
+        return Ok(BlockBases::new());
+    }
+    let inputs = AutoMergeInputs::new()?;
+    for (stage, name) in [(1, "base"), (2, "current"), (3, "incoming")] {
+        let bytes = stage_bytes(runner, session, stage, &entry.path).await?;
+        if bytes.len() > MERGE_CAP_BYTES || is_binary(&bytes) {
+            return Ok(BlockBases::new());
+        }
+        std::fs::write(inputs.0.join(name), bytes).map_err(|_| git_failed())?;
+    }
+    let output = runner
+        .run(
+            &inputs.0,
+            &[
+                "merge-file",
+                "--stdout",
+                "--diff3",
+                "--quiet",
+                "--marker-size=7",
+                "-L",
+                "current",
+                "-L",
+                "base",
+                "-L",
+                "incoming",
+                "current",
+                "base",
+                "incoming",
+            ],
+            READ_TIMEOUT,
+        )
+        .await
+        .map_err(|_| git_failed())?;
+    // A conflict is an expected nonzero exit. Actual failures have stderr and
+    // must not be treated as an empty/clean merge.
+    if !output.success && (!output.stderr.is_empty() || output.stdout.is_empty()) {
+        return Err(git_failed());
+    }
+    if output.stdout.len() > MERGE_OUTPUT_CAP_BYTES {
+        return Ok(BlockBases::new());
+    }
+    Ok(index_block_bases(parse_merge_file(&output.stdout)?))
+}
+
+async fn core_auto_resolve(
+    runner: &GitRunner,
+    registry: &mut RepoRegistry,
+    request: &ConflictAutoResolveRequest,
+) -> Result<ConflictAutoResolveResult, AppError> {
+    let session = check_write_context(
+        registry,
+        &request.repo_id,
+        request.expected_version,
+        "resolve conflicts",
+    )?;
+    let queue = registry.queue_for(&session.key());
+    let _guard = queue.lock().await;
+    let (raw, entry) = resolve_conflict_path(
+        runner,
+        registry,
+        &request.repo_id,
+        &session,
+        &request.path_id,
+    )
+    .await?;
+    let target = worktree_path(&session, &raw)?;
+    if !std::fs::symlink_metadata(&target)
+        .map_err(|_| git_failed())?
+        .is_file()
+    {
+        return Err(bad_request("Auto resolve requires a regular working file"));
+    }
+    let doc = core_hunks(runner, registry, &request.repo_id, &request.path_id).await?;
+    if doc.working_fingerprint != request.working_fingerprint {
+        return Err(stale_state());
+    }
+    let segments = parse_merge_file(doc.working_text.as_bytes())?;
+    let needs_base = segments.iter().any(|segment| matches!(segment, MergeSegment::Conflict(block) if !block.has_base && block.current != block.incoming));
+    let bases = if needs_base {
+        read_block_bases(runner, &session, &entry).await?
+    } else {
+        BlockBases::new()
+    };
+    let mut picks = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for segment in segments {
+        let MergeSegment::Conflict(block) = segment else {
+            continue;
+        };
+        let recovered = bases
+            .get(&(block.current.clone(), block.incoming.clone()))
+            .and_then(Option::as_deref);
+        let base = if block.has_base {
+            Some(block.base.as_slice())
+        } else {
+            recovered
+        };
+        if let Some(lines) = crate::git::auto_merge::resolve(base, &block.current, &block.incoming)
+        {
+            if seen.insert(block.id.clone()) {
+                picks.push(MergeBlockPick {
+                    hunk_id: block.id,
+                    lines: lines
+                        .into_iter()
+                        .map(|line| match line {
+                            crate::git::auto_merge::Pick::Current(index) => MergePickedLine {
+                                side: "current".into(),
+                                index,
+                            },
+                            crate::git::auto_merge::Pick::Incoming(index) => MergePickedLine {
+                                side: "incoming".into(),
+                                index,
+                            },
+                        })
+                        .collect(),
+                });
+            }
+        }
+    }
+    let working = std::fs::read(worktree_path(&session, &raw)?).map_err(|_| git_failed())?;
+    if fingerprint(&working) != request.working_fingerprint {
+        return Err(stale_state());
+    }
+    let (_, latest) = resolve_conflict_path(
+        runner,
+        registry,
+        &request.repo_id,
+        &session,
+        &request.path_id,
+    )
+    .await?;
+    if latest.stages != entry.stages {
+        return Err(stale_state());
+    }
+    Ok(ConflictAutoResolveResult {
+        working_fingerprint: doc.working_fingerprint,
+        picks,
+    })
+}
+
+async fn core_merge(
+    runner: &GitRunner,
+    registry: &mut RepoRegistry,
+    repo_id: &str,
+    request: &ConflictMergeRequest,
+) -> Result<ConflictMergeResult, AppError> {
+    let path_id = request.path_id.as_str();
+    if request.result_text.is_some() && !request.picks.is_empty() {
+        return Err(bad_request(
+            "Send either edited text or line selections, not both",
+        ));
+    }
+    if request.result_text.is_none() && request.picks.is_empty() {
+        return Err(bad_request("Select at least one block or line first"));
+    }
+    let total_picks: usize = request.picks.iter().map(|p| p.lines.len()).sum();
+    if total_picks > MAX_MERGE_PICKS {
+        return Err(bad_request(
+            "Too many picked lines; resolve in smaller steps",
+        ));
+    }
+    let session = check_write_context(
+        registry,
+        repo_id,
+        request.expected_version,
+        "resolve conflicts",
+    )?;
+    let queue = registry.queue_for(&session.key());
+    let _guard = queue.lock().await;
+
+    let (raw, entry) = resolve_conflict_path(runner, registry, repo_id, &session, path_id).await?;
+    let textness = stage_textness(runner, &session, &entry).await?;
+    let (kind, supported, _) = kind_of(&entry, &textness);
+    if !supported || kind != "text" {
+        return Err(bad_request(
+            "The merge editor covers supported text conflicts only",
+        ));
+    }
+    let target = worktree_path(&session, &raw)?;
+    let meta = std::fs::symlink_metadata(&target)
+        .map_err(|_| bad_request("Working file is missing; refresh and preview again"))?;
+    if !meta.is_file() {
+        return Err(bad_request(
+            "Working path is not a regular file; resolve it outside the app, then mark resolved",
+        ));
+    }
+    let working = std::fs::read(&target).map_err(|_| git_failed())?;
+    if fingerprint(&working) != request.working_fingerprint {
+        return Err(stale_state());
+    }
+    if working.len() > MERGE_CAP_BYTES {
+        return Err(bad_request(
+            "This file is too large for the merge editor; resolve it outside the app, then mark resolved",
+        ));
+    }
+    let segments = parse_merge_file(&working)?;
+    let mut blocks = std::collections::HashMap::new();
+    for segment in &segments {
+        if let MergeSegment::Conflict(block) = segment {
+            blocks.insert(block.id.clone(), block);
+        }
+    }
+    // Picks reference block identities issued by conflict_hunks; anything
+    // unknown or out of range means the file drifted underneath the UI.
+    let mut seen = std::collections::HashSet::new();
+    let mut picked: std::collections::HashMap<&str, &MergeBlockPick> =
+        std::collections::HashMap::new();
+    for pick in &request.picks {
+        if pick.hunk_id.is_empty() || pick.hunk_id.len() > 128 {
+            return Err(bad_request("Invalid hunk identity"));
+        }
+        if !seen.insert(pick.hunk_id.as_str()) {
+            return Err(bad_request("Duplicate hunk in one resolution"));
+        }
+        let block = blocks.get(pick.hunk_id.as_str()).ok_or_else(stale_state)?;
+        for line in &pick.lines {
+            let side = match line.side.as_str() {
+                "current" => &block.current,
+                "incoming" => &block.incoming,
+                _ => return Err(bad_request("Picked side must be current or incoming")),
+            };
+            if line.index >= side.len() {
+                return Err(stale_state());
+            }
+        }
+        picked.insert(pick.hunk_id.as_str(), pick);
+    }
+    let mut out: Vec<u8> = Vec::new();
+    for segment in &segments {
+        match segment {
+            MergeSegment::Clean { bytes } => out.extend_from_slice(bytes),
+            MergeSegment::Conflict(block) => match picked.get(block.id.as_str()) {
+                None => out.extend_from_slice(&block.raw),
+                Some(pick) => {
+                    for line in &pick.lines {
+                        let side = if line.side == "current" {
+                            &block.current
+                        } else {
+                            &block.incoming
+                        };
+                        out.extend_from_slice(&side[line.index]);
+                    }
+                }
+            },
+        }
+        if out.len() > MERGE_OUTPUT_CAP_BYTES {
+            return Err(bad_request(
+                "Merged output is too large; resolve in smaller steps",
+            ));
+        }
+    }
+    let (resolved_blocks, remaining_blocks) = if let Some(text) = &request.result_text {
+        if text.len() > MERGE_CAP_BYTES || text.contains('\0') {
+            return Err(bad_request(
+                "Edited result must be UTF-8 text under 256 KiB without NUL bytes",
+            ));
+        }
+        // Validate retained markers before writing so partial edits can be reopened.
+        let edited = parse_merge_file(text.as_bytes())?;
+        let remaining = edited
+            .iter()
+            .filter(|s| matches!(s, MergeSegment::Conflict(_)))
+            .count();
+        out = text.as_bytes().to_vec();
+        (blocks.len().saturating_sub(remaining), remaining)
+    } else {
+        (picked.len(), blocks.len() - picked.len())
+    };
+    // Create a private sibling, preserve executable bits, then atomically replace.
+    // A pre-existing file/symlink must never become an output target.
+    use std::io::Write;
+    static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp = target.clone().into_os_string();
+    tmp.push(format!(".octopus-merge-{}-{serial}", std::process::id()));
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|_| git_failed())?;
+    let write_result = (|| {
+        output.write_all(&out).map_err(|_| git_failed())?;
+        output
+            .set_permissions(meta.permissions())
+            .map_err(|_| git_failed())?;
+        output.sync_all().map_err(|_| git_failed())?;
+        if fingerprint(&std::fs::read(&target).map_err(|_| git_failed())?)
+            != request.working_fingerprint
+        {
+            return Err(stale_state());
+        }
+        std::fs::rename(&tmp, &target).map_err(|_| git_failed())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write_result?;
+    let snapshot = fresh_snapshot(runner, registry, repo_id).await?;
+    Ok(ConflictMergeResult {
+        snapshot,
+        working_fingerprint: fingerprint(&out),
+        resolved_blocks,
+        remaining_blocks,
     })
 }
 
@@ -1307,6 +1957,53 @@ pub struct ConflictResolveRequest {
     pub resolution: MarkResolution,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictHunksRequest {
+    pub request_id: RequestId,
+    pub repo_id: String,
+    pub path_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictMergeRequest {
+    pub request_id: RequestId,
+    pub repo_id: String,
+    pub expected_version: u64,
+    pub path_id: String,
+    pub working_fingerprint: String,
+    pub picks: Vec<MergeBlockPick>,
+    #[serde(default)]
+    pub result_text: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictMergeResult {
+    pub snapshot: RepoSnapshot,
+    pub working_fingerprint: String,
+    pub resolved_blocks: usize,
+    pub remaining_blocks: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictAutoResolveRequest {
+    pub request_id: RequestId,
+    pub repo_id: String,
+    pub expected_version: u64,
+    pub path_id: String,
+    pub working_fingerprint: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictAutoResolveResult {
+    pub working_fingerprint: String,
+    pub picks: Vec<MergeBlockPick>,
+}
+
 // ---- Commands ----
 
 #[tauri::command]
@@ -1395,6 +2092,63 @@ pub async fn conflict_mark_resolved(
 }
 
 #[tauri::command]
+pub async fn conflict_hunks(
+    registry: State<'_, Mutex<RepoRegistry>>,
+    request: ConflictHunksRequest,
+) -> Result<ApiResult<ConflictHunks>, String> {
+    let request_id = request.request_id.clone();
+    let result = async {
+        check_request_id(&request_id)?;
+        let runner = git_runner()?;
+        let registry = registry.lock().await;
+        core_hunks(&runner, &registry, &request.repo_id, &request.path_id).await
+    }
+    .await;
+    Ok(match result {
+        Ok(data) => ApiResult::ok(data, request_id),
+        Err(error) => ApiResult::err(error, request_id),
+    })
+}
+
+#[tauri::command]
+pub async fn conflict_auto_resolve(
+    registry: State<'_, Mutex<RepoRegistry>>,
+    request: ConflictAutoResolveRequest,
+) -> Result<ApiResult<ConflictAutoResolveResult>, String> {
+    let request_id = request.request_id.clone();
+    let result = async {
+        check_request_id(&request_id)?;
+        let runner = git_runner()?;
+        let mut registry = registry.lock().await;
+        core_auto_resolve(&runner, &mut registry, &request).await
+    }
+    .await;
+    Ok(match result {
+        Ok(data) => ApiResult::ok(data, request_id),
+        Err(error) => ApiResult::err(error, request_id),
+    })
+}
+
+#[tauri::command]
+pub async fn conflict_merge(
+    registry: State<'_, Mutex<RepoRegistry>>,
+    request: ConflictMergeRequest,
+) -> Result<ApiResult<ConflictMergeResult>, String> {
+    let request_id = request.request_id.clone();
+    let result = async {
+        check_request_id(&request_id)?;
+        let runner = git_runner()?;
+        let mut registry = registry.lock().await;
+        core_merge(&runner, &mut registry, &request.repo_id, &request).await
+    }
+    .await;
+    Ok(match result {
+        Ok(data) => ApiResult::ok(data, request_id),
+        Err(error) => ApiResult::err(error, request_id),
+    })
+}
+
+#[tauri::command]
 pub async fn merge_start(
     registry: State<'_, Mutex<RepoRegistry>>,
     request: MergeStartRequest,
@@ -1468,10 +2222,12 @@ pub async fn merge_abort(
 
 pub mod prelude {
     pub use super::{
-        conflict_accept, conflict_list, conflict_mark_resolved, conflict_preview, merge_abort,
-        merge_complete, merge_start, ConflictAcceptRequest, ConflictAcceptResult, ConflictFile,
-        ConflictList, ConflictPreview, ConflictPreviewRequest, ConflictResolveRequest,
-        MarkResolution, MergeAbortRequest, MergeCompleteRequest, MergeCompleteResult, MergeContext,
+        conflict_accept, conflict_auto_resolve, conflict_hunks, conflict_list,
+        conflict_mark_resolved, conflict_merge, conflict_preview, merge_abort, merge_complete,
+        merge_start, ConflictAcceptRequest, ConflictAcceptResult, ConflictFile, ConflictHunks,
+        ConflictHunksRequest, ConflictList, ConflictMergeRequest, ConflictMergeResult,
+        ConflictPreview, ConflictPreviewRequest, ConflictResolveRequest, MarkResolution,
+        MergeAbortRequest, MergeCompleteRequest, MergeCompleteResult, MergeContext,
         MergeStartRequest, MergeStartResult, StagePreview,
     };
 }
@@ -2455,5 +3211,864 @@ mod tests {
         assert_eq!(err.code, ErrorCode::CONFLICTS_PRESENT);
         // The merge is still open afterwards.
         assert!(repo.join(".git").join("MERGE_HEAD").exists());
+    }
+
+    fn block_of(segments: &[MergeSegment]) -> &MergeBlock {
+        segments
+            .iter()
+            .find_map(|s| match s {
+                MergeSegment::Conflict(b) => Some(b),
+                _ => None,
+            })
+            .expect("one conflict block")
+    }
+
+    #[test]
+    fn merge_dto_json_matches_frontend_contract() {
+        let hunks = ConflictHunks {
+            path_id: "f.txt".to_string(),
+            display_path: "f.txt".to_string(),
+            current_label: "main".to_string(),
+            incoming_label: "feature".to_string(),
+            working_fingerprint: "ab:1".to_string(),
+            working_text: "top\nraw".to_string(),
+            segments: vec![
+                MergeSegmentDto::Clean {
+                    lines: vec!["top".to_string()],
+                },
+                MergeSegmentDto::Conflict {
+                    hunk_id: "h1".to_string(),
+                    current: vec!["c".to_string()],
+                    incoming: vec!["i".to_string()],
+                    base: vec![],
+                    raw: "raw".to_string(),
+                },
+            ],
+            conflict_count: 1,
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&hunks).expect("json")).expect("parse");
+        assert_eq!(value["workingFingerprint"], "ab:1");
+        assert_eq!(value["workingText"], "top\nraw");
+        assert_eq!(value["conflictCount"], 1);
+        assert_eq!(value["segments"][0]["kind"], "clean");
+        assert_eq!(value["segments"][1]["kind"], "conflict");
+        assert_eq!(value["segments"][1]["hunkId"], "h1");
+        let pick: MergeBlockPick =
+            serde_json::from_str(r#"{"hunkId":"h1","lines":[{"side":"incoming","index":2}]}"#)
+                .expect("pick");
+        assert_eq!(pick.lines[0].side, "incoming");
+        assert_eq!(pick.lines[0].index, 2);
+        let result = ConflictAutoResolveResult {
+            working_fingerprint: "fp".into(),
+            picks: vec![pick],
+        };
+        let json = serde_json::to_value(result).unwrap();
+        assert_eq!(json["workingFingerprint"], "fp");
+        assert_eq!(json["picks"][0]["hunkId"], "h1");
+    }
+
+    #[test]
+    fn merge_parser_splits_clean_and_conflict() {
+        let bytes = b"head\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> feature\ntail\n";
+        let segments = parse_merge_file(bytes).expect("parse");
+        assert_eq!(segments.len(), 3);
+        assert!(matches!(&segments[0], MergeSegment::Clean { bytes } if bytes == b"head\n"));
+        assert!(matches!(&segments[2], MergeSegment::Clean { bytes } if bytes == b"tail\n"));
+        let block = block_of(&segments);
+        assert_eq!(block.current, vec![b"ours\n".to_vec()]);
+        assert_eq!(block.incoming, vec![b"theirs\n".to_vec()]);
+        assert!(block.base.is_empty());
+        assert!(!block.id.is_empty());
+        // Identity is stable for identical bytes.
+        let again = parse_merge_file(bytes).expect("parse");
+        assert_eq!(block_of(&again).id, block.id);
+    }
+
+    #[test]
+    fn merge_parser_reads_diff3_base() {
+        let bytes = b"<<<<<<< HEAD\nours\n||||||| base\norig\n=======\ntheirs\n>>>>>>> feature\n";
+        let segments = parse_merge_file(bytes).expect("parse");
+        let block = block_of(&segments);
+        assert_eq!(block.current, vec![b"ours\n".to_vec()]);
+        assert_eq!(block.base, vec![b"orig\n".to_vec()]);
+        assert_eq!(block.incoming, vec![b"theirs\n".to_vec()]);
+    }
+
+    #[test]
+    fn merge_parser_rejects_malformed() {
+        // Unclosed block at EOF.
+        assert!(parse_merge_file(b"a\n<<<<<<< HEAD\nx\n=======\ny\n").is_err());
+        // Nested opener inside a block.
+        assert!(
+            parse_merge_file(b"<<<<<<< HEAD\nx\n<<<<<<< HEAD\ny\n=======\nz\n>>>>>>> f\n").is_err()
+        );
+        // Closer without a separator.
+        assert!(parse_merge_file(b"<<<<<<< HEAD\nx\n>>>>>>> f\n").is_err());
+        // Separator-looking lines outside any block stay clean content.
+        let segments = parse_merge_file(b"=======\nplain\n>>>>>>> nope\n").expect("clean");
+        assert_eq!(segments.len(), 1);
+        assert!(matches!(&segments[0], MergeSegment::Clean { .. }));
+    }
+
+    #[test]
+    fn merge_parser_preserves_endings_byte_exact() {
+        let bytes = b"a\r\n<<<<<<< HEAD\nx\r\n=======\r\ny\r\n>>>>>>> f\r\ntail";
+        let segments = parse_merge_file(bytes).expect("parse");
+        let block = block_of(&segments);
+        assert_eq!(block.current, vec![b"x\r\n".to_vec()]);
+        assert_eq!(block.incoming, vec![b"y\r\n".to_vec()]);
+        assert!(matches!(
+            segment_dto(&segments[0]),
+            MergeSegmentDto::Clean { ref lines } if lines == &["a".to_string()]
+        ));
+        // Round trip: clean bytes plus the verbatim block reproduce the file.
+        let mut rebuilt = Vec::new();
+        for segment in &segments {
+            match segment {
+                MergeSegment::Clean { bytes } => rebuilt.extend_from_slice(bytes),
+                MergeSegment::Conflict(b) => rebuilt.extend_from_slice(&b.raw),
+            }
+        }
+        assert_eq!(rebuilt, bytes);
+    }
+
+    /// Two-line-per-side conflicts in two blocks, kept apart by enough
+    /// context that git does not fuse them into one marker block.
+    const PAD: &str = "p1\np2\np3\np4\np5\n";
+
+    fn diverge_two_blocks(repo: &std::path::Path) {
+        git(repo, &["checkout", "-b", "feature"]);
+        std::fs::write(
+            repo.join("f.txt"),
+            format!("top\nF1\nF2\n{PAD}mid\nG1\nG2\nbottom\n"),
+        )
+        .expect("write");
+        git(repo, &["add", "f.txt"]);
+        git(repo, &["commit", "-m", "feature side"]);
+        git(repo, &["checkout", "main"]);
+        std::fs::write(
+            repo.join("f.txt"),
+            format!("top\nC1\nC2\n{PAD}mid\nH1\nH2\nbottom\n"),
+        )
+        .expect("write");
+        git(repo, &["add", "f.txt"]);
+        git(repo, &["commit", "-m", "main side"]);
+    }
+
+    async fn conflicted_repo(
+        label: &str,
+        base: String,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        GitRunner,
+        RepoRegistry,
+        String,
+        ConflictFile,
+    ) {
+        let (_dir, repo) = temp_repo(label);
+        std::fs::write(repo.join("f.txt"), base).expect("write");
+        git(&repo, &["add", "f.txt"]);
+        git(&repo, &["commit", "-m", "base"]);
+        diverge_two_blocks(&repo);
+        let runner = git_runner().expect("system git");
+        let mut registry = RepoRegistry::default();
+        let repo_id = open_repo(&mut registry, &repo);
+        let target = head_of(&repo);
+        let started = start(
+            &runner,
+            &mut registry,
+            &repo_id,
+            "refs/heads/feature",
+            &target,
+        )
+        .await;
+        assert!(started.conflicted);
+        live_status(&runner, &mut registry, &repo_id).await;
+        let list = core_list(&runner, &mut registry, &repo_id)
+            .await
+            .expect("list");
+        assert_eq!(list.files.len(), 1);
+        let file = list.files[0].clone();
+        assert_eq!(file.kind, "text");
+        (_dir, repo, runner, registry, repo_id, file)
+    }
+
+    fn merge_request(
+        repo_id: &str,
+        version: u64,
+        path_id: &str,
+        fingerprint: &str,
+        picks: Vec<MergeBlockPick>,
+    ) -> ConflictMergeRequest {
+        ConflictMergeRequest {
+            request_id: "test".to_string(),
+            repo_id: repo_id.to_string(),
+            expected_version: version,
+            path_id: path_id.to_string(),
+            working_fingerprint: fingerprint.to_string(),
+            picks,
+            result_text: None,
+        }
+    }
+
+    fn take_all(hunk_id: &str, side: &str, count: usize) -> MergeBlockPick {
+        MergeBlockPick {
+            hunk_id: hunk_id.to_string(),
+            lines: (0..count)
+                .map(|index| MergePickedLine {
+                    side: side.to_string(),
+                    index,
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_hunks_lists_blocks_from_live_conflict() {
+        let (_d, _r, runner, registry, repo_id, file) = conflicted_repo(
+            "merge-hunks",
+            format!("top\nX\nY\n{PAD}mid\nZ\nW\nbottom\n"),
+        )
+        .await;
+        let hunks = core_hunks(&runner, &registry, &repo_id, &file.path_id)
+            .await
+            .expect("hunks");
+        assert_eq!(hunks.conflict_count, 2);
+        assert_eq!(hunks.current_label, "main");
+        assert_eq!(hunks.incoming_label, "feature");
+        let conflicts: Vec<_> = hunks
+            .segments
+            .iter()
+            .filter_map(|s| match s {
+                MergeSegmentDto::Conflict {
+                    hunk_id,
+                    current,
+                    incoming,
+                    ..
+                } => Some((hunk_id.clone(), current.clone(), incoming.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(conflicts[0].1, vec!["C1".to_string(), "C2".to_string()]);
+        assert_eq!(conflicts[0].2, vec!["F1".to_string(), "F2".to_string()]);
+        assert_ne!(conflicts[0].0, conflicts[1].0);
+    }
+
+    #[tokio::test]
+    async fn merge_resolve_takes_whole_block_and_mixes_lines() {
+        let (_d, repo, runner, mut registry, repo_id, file) =
+            conflicted_repo("merge-mix", format!("top\nX\nY\n{PAD}mid\nZ\nW\nbottom\n")).await;
+        let hunks = core_hunks(&runner, &registry, &repo_id, &file.path_id)
+            .await
+            .expect("hunks");
+        let ids: Vec<String> = hunks
+            .segments
+            .iter()
+            .filter_map(|s| match s {
+                MergeSegmentDto::Conflict { hunk_id, .. } => Some(hunk_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 2);
+        // Block one takes current whole; block two mixes current line 0
+        // with incoming line 1.
+        let v = version_of(&registry, &repo_id);
+        let result = core_merge(
+            &runner,
+            &mut registry,
+            &repo_id,
+            &merge_request(
+                &repo_id,
+                v,
+                &file.path_id,
+                &hunks.working_fingerprint,
+                vec![
+                    take_all(&ids[0], "current", 2),
+                    MergeBlockPick {
+                        hunk_id: ids[1].clone(),
+                        lines: vec![
+                            MergePickedLine {
+                                side: "current".to_string(),
+                                index: 0,
+                            },
+                            MergePickedLine {
+                                side: "incoming".to_string(),
+                                index: 1,
+                            },
+                        ],
+                    },
+                ],
+            ),
+        )
+        .await
+        .expect("merge");
+        assert_eq!(result.resolved_blocks, 2);
+        assert_eq!(result.remaining_blocks, 0);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("f.txt")).expect("read"),
+            format!("top\nC1\nC2\n{PAD}mid\nH1\nG2\nbottom\n")
+        );
+        assert_eq!(
+            result.working_fingerprint,
+            fingerprint(&std::fs::read(repo.join("f.txt")).expect("read"))
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_resolve_keeps_unpicked_markers() {
+        let (_d, repo, runner, mut registry, repo_id, file) = conflicted_repo(
+            "merge-partial",
+            format!("top\nX\nY\n{PAD}mid\nZ\nW\nbottom\n"),
+        )
+        .await;
+        let hunks = core_hunks(&runner, &registry, &repo_id, &file.path_id)
+            .await
+            .expect("hunks");
+        let first = hunks
+            .segments
+            .iter()
+            .find_map(|s| match s {
+                MergeSegmentDto::Conflict { hunk_id, .. } => Some(hunk_id.clone()),
+                _ => None,
+            })
+            .expect("first block");
+        let v = version_of(&registry, &repo_id);
+        let result = core_merge(
+            &runner,
+            &mut registry,
+            &repo_id,
+            &merge_request(
+                &repo_id,
+                v,
+                &file.path_id,
+                &hunks.working_fingerprint,
+                vec![take_all(&first, "incoming", 2)],
+            ),
+        )
+        .await
+        .expect("partial merge");
+        assert_eq!(result.resolved_blocks, 1);
+        assert_eq!(result.remaining_blocks, 1);
+        let text = std::fs::read_to_string(repo.join("f.txt")).expect("read");
+        assert!(text.starts_with(&format!("top\nF1\nF2\n{PAD}mid\n")));
+        assert!(text.contains("<<<<<<<"));
+        assert!(text.contains(">>>>>>>"));
+    }
+
+    #[tokio::test]
+    async fn merge_resolve_accepts_explicit_empty_block_selection() {
+        let (_d, repo, runner, mut registry, repo_id, file) = conflicted_repo(
+            "merge-empty",
+            format!("top\nX\nY\n{PAD}mid\nZ\nW\nbottom\n"),
+        )
+        .await;
+        // A text conflict may have no lines on one side (a deleted region).
+        let working = "top\r\n<<<<<<< HEAD\r\n=======\r\nincoming\r\n>>>>>>> feature\r\ntail";
+        std::fs::write(repo.join("f.txt"), working).expect("write empty-side markers");
+        let hunks = core_hunks(&runner, &registry, &repo_id, &file.path_id)
+            .await
+            .expect("hunks");
+        let hunk_id = hunks
+            .segments
+            .iter()
+            .find_map(|segment| match segment {
+                MergeSegmentDto::Conflict {
+                    hunk_id, current, ..
+                } => {
+                    assert!(current.is_empty());
+                    Some(hunk_id.clone())
+                }
+                _ => None,
+            })
+            .expect("empty-side conflict");
+        let version = version_of(&registry, &repo_id);
+        let result = core_merge(
+            &runner,
+            &mut registry,
+            &repo_id,
+            &merge_request(
+                &repo_id,
+                version,
+                &file.path_id,
+                &hunks.working_fingerprint,
+                vec![MergeBlockPick {
+                    hunk_id,
+                    lines: vec![],
+                }],
+            ),
+        )
+        .await
+        .expect("resolve with empty side");
+        assert_eq!(result.resolved_blocks, 1);
+        assert_eq!(result.remaining_blocks, 0);
+        assert_eq!(
+            std::fs::read(repo.join("f.txt")).expect("read"),
+            b"top\r\ntail"
+        );
+        let listed = core_list(&runner, &mut registry, &repo_id)
+            .await
+            .expect("unmerged index");
+        assert_eq!(listed.files.len(), 1, "resolution must stay unstaged");
+    }
+
+    #[test]
+    fn auto_base_lookup_trims_only_unchanged_edges_and_rejects_ambiguous_bases() {
+        let canonical = b"<<<<<<< current\nsame\nA\nb\ntail\n||||||| base\nsame\na\nb\ntail\n=======\nsame\na\nB\ntail\n>>>>>>> incoming\n";
+        let bases = index_block_bases(parse_merge_file(canonical).unwrap());
+        let key = (
+            vec![b"A\n".to_vec(), b"b\n".to_vec()],
+            vec![b"a\n".to_vec(), b"B\n".to_vec()],
+        );
+        assert_eq!(
+            bases.get(&key),
+            Some(&Some(vec![b"a\n".to_vec(), b"b\n".to_vec()]))
+        );
+        let ambiguous = b"<<<<<<< current\nours\n||||||| base\nbase1\n=======\ntheirs\n>>>>>>> incoming\n<<<<<<< current\nours\n||||||| base\nbase2\n=======\ntheirs\n>>>>>>> incoming\n";
+        let bases = index_block_bases(parse_merge_file(ambiguous).unwrap());
+        assert_eq!(
+            bases.get(&(vec![b"ours\n".to_vec()], vec![b"theirs\n".to_vec()])),
+            Some(&None)
+        );
+        let changed_edge = b"<<<<<<< current\nshared addition\nours\n||||||| base\nold\n=======\nshared addition\ntheirs\n>>>>>>> incoming\n";
+        let bases = index_block_bases(parse_merge_file(changed_edge).unwrap());
+        assert!(!bases.contains_key(&(vec![b"ours\n".to_vec()], vec![b"theirs\n".to_vec()])));
+    }
+
+    #[tokio::test]
+    async fn auto_resolve_recovers_base_preserves_working_edits_and_leaves_overlap() {
+        let (_dir, repo) = temp_repo("auto-adjacent");
+        std::fs::write(repo.join("f.txt"), format!("top\na\nb\n{PAD}old\ntail\n")).unwrap();
+        git(&repo, &["add", "f.txt"]);
+        git(&repo, &["commit", "-m", "base"]);
+        git(&repo, &["checkout", "-b", "feature"]);
+        std::fs::write(
+            repo.join("f.txt"),
+            format!("top\na\nB\n{PAD}incoming\ntail\n"),
+        )
+        .unwrap();
+        git(&repo, &["add", "f.txt"]);
+        git(&repo, &["commit", "-m", "incoming"]);
+        git(&repo, &["checkout", "main"]);
+        std::fs::write(
+            repo.join("f.txt"),
+            format!("top\nA\nb\n{PAD}current\ntail\n"),
+        )
+        .unwrap();
+        git(&repo, &["add", "f.txt"]);
+        git(&repo, &["commit", "-m", "current"]);
+        let runner = git_runner().unwrap();
+        let mut registry = RepoRegistry::default();
+        let repo_id = open_repo(&mut registry, &repo);
+        let result = start(
+            &runner,
+            &mut registry,
+            &repo_id,
+            "refs/heads/feature",
+            &head_of(&repo),
+        )
+        .await;
+        assert!(result.conflicted);
+        live_status(&runner, &mut registry, &repo_id).await;
+        let files = core_list(&runner, &mut registry, &repo_id)
+            .await
+            .unwrap()
+            .files;
+        let path_id = &files[0].path_id;
+        let working = std::fs::read_to_string(repo.join("f.txt"))
+            .unwrap()
+            .replacen("top\n", "edited context\n", 1);
+        std::fs::write(repo.join("f.txt"), &working).unwrap();
+        let doc = core_hunks(&runner, &registry, &repo_id, path_id)
+            .await
+            .unwrap();
+        assert_eq!(doc.conflict_count, 2);
+        let index = std::fs::read(repo.join(".git/index")).unwrap();
+        let version = version_of(&registry, &repo_id);
+        let request = ConflictAutoResolveRequest {
+            request_id: "auto-test".into(),
+            repo_id: repo_id.clone(),
+            expected_version: version,
+            path_id: path_id.clone(),
+            working_fingerprint: doc.working_fingerprint.clone(),
+        };
+        let auto = core_auto_resolve(&runner, &mut registry, &request)
+            .await
+            .unwrap();
+        assert_eq!(auto.picks.len(), 1);
+        assert_eq!(auto.picks[0].lines.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("f.txt")).unwrap(),
+            working
+        );
+        assert_eq!(std::fs::read(repo.join(".git/index")).unwrap(), index);
+        assert_eq!(version_of(&registry, &repo_id), version);
+        let save = merge_request(
+            &repo_id,
+            version,
+            path_id,
+            &doc.working_fingerprint,
+            auto.picks,
+        );
+        let saved = core_merge(&runner, &mut registry, &repo_id, &save)
+            .await
+            .unwrap();
+        assert_eq!(saved.remaining_blocks, 1);
+        let after = std::fs::read_to_string(repo.join("f.txt")).unwrap();
+        assert!(after.starts_with("edited context\nA\nB\n"));
+        assert!(after.contains("<<<<<<< HEAD\ncurrent\n=======\nincoming\n"));
+        assert_eq!(std::fs::read(repo.join(".git/index")).unwrap(), index);
+    }
+
+    #[tokio::test]
+    async fn auto_resolve_rejects_stale_requests_and_preserves_ambiguous_file() {
+        let (_dir, repo, runner, mut registry, repo_id, file) =
+            conflicted_repo("auto-stale", format!("top\nX\nY\n{PAD}mid\nZ\nW\nbottom\n")).await;
+        let doc = core_hunks(&runner, &registry, &repo_id, &file.path_id)
+            .await
+            .unwrap();
+        let before = std::fs::read(repo.join("f.txt")).unwrap();
+        let mut request = ConflictAutoResolveRequest {
+            request_id: "auto-test".into(),
+            repo_id: repo_id.clone(),
+            expected_version: version_of(&registry, &repo_id),
+            path_id: file.path_id,
+            working_fingerprint: "stale".into(),
+        };
+        assert_eq!(
+            core_auto_resolve(&runner, &mut registry, &request)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::STALE_STATE
+        );
+        request.working_fingerprint = doc.working_fingerprint;
+        assert!(core_auto_resolve(&runner, &mut registry, &request)
+            .await
+            .unwrap()
+            .picks
+            .is_empty());
+        request.expected_version += 1;
+        assert_eq!(
+            core_auto_resolve(&runner, &mut registry, &request)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::STALE_STATE
+        );
+        assert_eq!(std::fs::read(repo.join("f.txt")).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn auto_resolve_handles_diff3_deletions_empty_base_and_identical_sides() {
+        let (_dir, repo, runner, mut registry, repo_id, file) =
+            conflicted_repo("auto-diff3", format!("top\nX\nY\n{PAD}mid\nZ\nW\nbottom\n")).await;
+        let text = "prefix\r\n<<<<<<< HEAD\r\nold\r\n||||||| base\r\nold\r\n=======\r\n>>>>>>> feature\r\n<<<<<<< HEAD\r\n||||||| base\r\n=======\r\nadded\r\n>>>>>>> feature\r\n<<<<<<< HEAD\r\nsame\r\n=======\r\nsame\r\n>>>>>>> feature\r\n<<<<<<< HEAD\r\n=======\r\nunknown base\r\n>>>>>>> feature\r\ntail";
+        std::fs::write(repo.join("f.txt"), text).unwrap();
+        let doc = core_hunks(&runner, &registry, &repo_id, &file.path_id)
+            .await
+            .unwrap();
+        let request = ConflictAutoResolveRequest {
+            request_id: "auto-test".into(),
+            repo_id: repo_id.clone(),
+            expected_version: version_of(&registry, &repo_id),
+            path_id: file.path_id.clone(),
+            working_fingerprint: doc.working_fingerprint.clone(),
+        };
+        let auto = core_auto_resolve(&runner, &mut registry, &request)
+            .await
+            .unwrap();
+        assert_eq!(auto.picks.len(), 3);
+        assert!(auto.picks[0].lines.is_empty());
+        let save = merge_request(
+            &repo_id,
+            request.expected_version,
+            &file.path_id,
+            &doc.working_fingerprint,
+            auto.picks,
+        );
+        let saved = core_merge(&runner, &mut registry, &repo_id, &save)
+            .await
+            .unwrap();
+        assert_eq!(saved.remaining_blocks, 1);
+        assert_eq!(std::fs::read_to_string(repo.join("f.txt")).unwrap(), "prefix\r\nadded\r\nsame\r\n<<<<<<< HEAD\r\n=======\r\nunknown base\r\n>>>>>>> feature\r\ntail");
+    }
+
+    #[tokio::test]
+    async fn edited_result_saves_full_text_preserving_mode_and_unmerged_index() {
+        let (_d, repo, runner, mut registry, repo_id, file) = conflicted_repo(
+            "edited-result",
+            format!("top\nX\nY\n{PAD}mid\nZ\nW\nbottom\n"),
+        )
+        .await;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(repo.join("f.txt"), std::fs::Permissions::from_mode(0o755))
+                .expect("mode");
+        }
+        let doc = core_hunks(&runner, &registry, &repo_id, &file.path_id)
+            .await
+            .expect("doc");
+        assert!(doc.working_text.starts_with("top\n"));
+        let mut request = merge_request(
+            &repo_id,
+            version_of(&registry, &repo_id),
+            &file.path_id,
+            &doc.working_fingerprint,
+            vec![],
+        );
+        request.result_text =
+            Some("edited clean context\r\ncustom resolution\r\ntail without newline".into());
+        let saved = core_merge(&runner, &mut registry, &repo_id, &request)
+            .await
+            .expect("save");
+        assert_eq!(saved.remaining_blocks, 0);
+        assert_eq!(saved.resolved_blocks, 2);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("f.txt")).expect("read"),
+            request.result_text.clone().unwrap()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(repo.join("f.txt"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755
+            );
+        }
+        live_status(&runner, &mut registry, &repo_id).await;
+        let files = core_list(&runner, &mut registry, &repo_id)
+            .await
+            .unwrap()
+            .files;
+        assert_eq!(files.len(), 1, "saving must keep the index unmerged");
+        let path_id = &files[0].path_id;
+        let reopened = core_hunks(&runner, &registry, &repo_id, path_id)
+            .await
+            .expect("reopen resolved text");
+        assert_eq!(reopened.conflict_count, 0);
+        let mut clear = merge_request(
+            &repo_id,
+            version_of(&registry, &repo_id),
+            path_id,
+            &saved.working_fingerprint,
+            vec![],
+        );
+        clear.result_text = Some(String::new());
+        core_merge(&runner, &mut registry, &repo_id, &clear)
+            .await
+            .expect("empty result");
+        assert_eq!(std::fs::read(repo.join("f.txt")).unwrap(), b"");
+    }
+
+    #[tokio::test]
+    async fn edited_result_rejects_stale_invalid_and_mixed_requests_without_writing() {
+        let (_d, repo, runner, mut registry, repo_id, file) = conflicted_repo(
+            "edited-invalid",
+            format!("top\nX\nY\n{PAD}mid\nZ\nW\nbottom\n"),
+        )
+        .await;
+        let doc = core_hunks(&runner, &registry, &repo_id, &file.path_id)
+            .await
+            .unwrap();
+        let before = std::fs::read(repo.join("f.txt")).unwrap();
+        for invalid in [
+            "bad\0text".to_string(),
+            "x".repeat(MERGE_CAP_BYTES + 1),
+            "<<<<<<< HEAD\nunfinished\n".to_string(),
+        ] {
+            let mut request = merge_request(
+                &repo_id,
+                version_of(&registry, &repo_id),
+                &file.path_id,
+                &doc.working_fingerprint,
+                vec![],
+            );
+            request.result_text = Some(invalid);
+            assert!(core_merge(&runner, &mut registry, &repo_id, &request)
+                .await
+                .is_err());
+            assert_eq!(std::fs::read(repo.join("f.txt")).unwrap(), before);
+        }
+        let mut request = merge_request(
+            &repo_id,
+            version_of(&registry, &repo_id),
+            &file.path_id,
+            "outdated",
+            vec![],
+        );
+        request.result_text = Some("new text".into());
+        assert_eq!(
+            core_merge(&runner, &mut registry, &repo_id, &request)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::STALE_STATE
+        );
+        request.working_fingerprint = doc.working_fingerprint;
+        request.picks = vec![take_all("any", "current", 1)];
+        assert_eq!(
+            core_merge(&runner, &mut registry, &repo_id, &request)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::INVALID_ARGUMENT
+        );
+        assert_eq!(std::fs::read(repo.join("f.txt")).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn edited_partial_result_can_be_reopened() {
+        let (_d, repo, runner, mut registry, repo_id, file) = conflicted_repo(
+            "edited-partial",
+            format!("top\nX\nY\n{PAD}mid\nZ\nW\nbottom\n"),
+        )
+        .await;
+        let doc = core_hunks(&runner, &registry, &repo_id, &file.path_id)
+            .await
+            .unwrap();
+        let mut request = merge_request(
+            &repo_id,
+            version_of(&registry, &repo_id),
+            &file.path_id,
+            &doc.working_fingerprint,
+            vec![],
+        );
+        let edited =
+            "custom prefix\n<<<<<<< HEAD\none\n=======\ntwo\n>>>>>>> feature\ncustom suffix\n";
+        request.result_text = Some(edited.into());
+        let saved = core_merge(&runner, &mut registry, &repo_id, &request)
+            .await
+            .unwrap();
+        assert_eq!(saved.remaining_blocks, 1);
+        assert_eq!(saved.resolved_blocks, 1);
+        assert_eq!(std::fs::read_to_string(repo.join("f.txt")).unwrap(), edited);
+        live_status(&runner, &mut registry, &repo_id).await;
+        let files = core_list(&runner, &mut registry, &repo_id)
+            .await
+            .unwrap()
+            .files;
+        let reopened = core_hunks(&runner, &registry, &repo_id, &files[0].path_id)
+            .await
+            .unwrap();
+        assert_eq!(reopened.conflict_count, 1);
+        assert_eq!(reopened.working_text, edited);
+    }
+
+    #[tokio::test]
+    async fn merge_resolve_rejects_stale_and_invalid_picks() {
+        let (_d, _r, runner, mut registry, repo_id, file) = conflicted_repo(
+            "merge-reject",
+            format!("top\nX\nY\n{PAD}mid\nZ\nW\nbottom\n"),
+        )
+        .await;
+        let hunks = core_hunks(&runner, &registry, &repo_id, &file.path_id)
+            .await
+            .expect("hunks");
+        let first = hunks
+            .segments
+            .iter()
+            .find_map(|s| match s {
+                MergeSegmentDto::Conflict { hunk_id, .. } => Some(hunk_id.clone()),
+                _ => None,
+            })
+            .expect("first block");
+
+        // Stale fingerprint fails closed without touching the file.
+        let before = hunks.working_fingerprint.clone();
+        let v = version_of(&registry, &repo_id);
+        let err = core_merge(
+            &runner,
+            &mut registry,
+            &repo_id,
+            &merge_request(
+                &repo_id,
+                v,
+                &file.path_id,
+                "deadbeef:1",
+                vec![take_all(&first, "current", 2)],
+            ),
+        )
+        .await
+        .expect_err("stale fingerprint");
+        assert_eq!(err.code, ErrorCode::STALE_STATE);
+
+        // Unknown hunk and out-of-range index mean drift.
+        let v = version_of(&registry, &repo_id);
+        let err = core_merge(
+            &runner,
+            &mut registry,
+            &repo_id,
+            &merge_request(
+                &repo_id,
+                v,
+                &file.path_id,
+                &before,
+                vec![take_all("nope", "current", 1)],
+            ),
+        )
+        .await
+        .expect_err("unknown hunk");
+        assert_eq!(err.code, ErrorCode::STALE_STATE);
+        let v = version_of(&registry, &repo_id);
+        let err = core_merge(
+            &runner,
+            &mut registry,
+            &repo_id,
+            &merge_request(
+                &repo_id,
+                v,
+                &file.path_id,
+                &before,
+                vec![MergeBlockPick {
+                    hunk_id: first.clone(),
+                    lines: vec![MergePickedLine {
+                        side: "current".to_string(),
+                        index: 99,
+                    }],
+                }],
+            ),
+        )
+        .await
+        .expect_err("out of range");
+        assert_eq!(err.code, ErrorCode::STALE_STATE);
+
+        // Malformed requests fail as invalid arguments instead.
+        let v = version_of(&registry, &repo_id);
+        let err = core_merge(
+            &runner,
+            &mut registry,
+            &repo_id,
+            &merge_request(&repo_id, v, &file.path_id, &before, vec![]),
+        )
+        .await
+        .expect_err("empty picks");
+        assert_eq!(err.code, ErrorCode::INVALID_ARGUMENT);
+        let v = version_of(&registry, &repo_id);
+        let err = core_merge(
+            &runner,
+            &mut registry,
+            &repo_id,
+            &merge_request(
+                &repo_id,
+                v,
+                &file.path_id,
+                &before,
+                vec![
+                    take_all(&first, "current", 2),
+                    take_all(&first, "incoming", 2),
+                ],
+            ),
+        )
+        .await
+        .expect_err("duplicate hunk");
+        assert_eq!(err.code, ErrorCode::INVALID_ARGUMENT);
     }
 }

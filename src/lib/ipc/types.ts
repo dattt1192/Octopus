@@ -373,6 +373,50 @@ export interface ConflictPreview {
   incomingLabel: string;
 }
 
+export type MergeSegment =
+  | { kind: "clean"; lines: string[] }
+  | {
+      kind: "conflict";
+      hunkId: string;
+      current: string[];
+      incoming: string[];
+      base: string[];
+      raw: string;
+    };
+
+export interface ConflictHunks {
+  pathId: string;
+  displayPath: string;
+  currentLabel: string;
+  incomingLabel: string;
+  workingFingerprint: string;
+  segments: MergeSegment[];
+  workingText: string;
+  conflictCount: number;
+}
+
+export interface MergePickedLine {
+  side: "current" | "incoming";
+  index: number;
+}
+
+export interface MergeBlockPick {
+  hunkId: string;
+  lines: MergePickedLine[];
+}
+
+export interface ConflictMergeResult {
+  snapshot: RepoSnapshot;
+  workingFingerprint: string;
+  resolvedBlocks: number;
+  remainingBlocks: number;
+}
+
+export interface ConflictAutoResolveResult {
+  workingFingerprint: string;
+  picks: MergeBlockPick[];
+}
+
 export interface MergeStartResult {
   snapshot: RepoSnapshot;
   conflicted: boolean;
@@ -404,6 +448,16 @@ export interface IdentityInfo {
 export interface CommitResult {
   oid: string;
   snapshot: RepoSnapshot;
+}
+
+export interface CommitCreateRequest {
+  requestId: RequestId;
+  repoId: RepoId;
+  expectedVersion: Version;
+  subject: string;
+  body: string;
+  /** Null creates a commit; an OID replaces only that exact HEAD. */
+  amendOid: Oid | null;
 }
 
 export interface BranchCreateResult {
