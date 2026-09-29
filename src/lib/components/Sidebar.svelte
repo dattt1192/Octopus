@@ -7,6 +7,7 @@
   // The stashes section lists real entries with apply/pop restore through
   // the shared stash flows; listing needs no trust, restore does.
   import type { AppError, RefItem, StashEntry } from "../ipc/types";
+  import { formatDateTime } from "../format/date";
   import ContextMenu from "./ContextMenu.svelte";
   import {
     isContextMenuKey,
@@ -129,7 +130,7 @@
 
   function createdLabel(createdAt: number): string {
     if (!createdAt) return "unknown time";
-    return new Date(createdAt * 1000).toLocaleString();
+    return formatDateTime(createdAt * 1000);
   }
 
   function refTitle(ref: RefItem): string {

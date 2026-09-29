@@ -9,7 +9,8 @@
   import { windowRows, type LaidRow } from "../graph/layout";
 
   import ColumnResize from "./ColumnResize.svelte";
-  import { COLUMNS_KEY, COLUMN_LIMITS, clampColumn, defaultColumns, formatCommitDate, restoreColumns, type HistoryColumn } from "../history/columns";
+  import { COLUMNS_KEY, COLUMN_LIMITS, clampColumn, defaultColumns, restoreColumns, type HistoryColumn } from "../history/columns";
+  import { formatDateTime } from "../format/date";
   import { refItemForBadge, refsByCommit, type RefBadge } from "../history/refs";
   import ContextMenu from "./ContextMenu.svelte";
   import { isContextMenuKey, pointFromContextEvent, type ContextMenuItem } from "../context-menu/model";
@@ -126,7 +127,7 @@
   const graphContentWidth = $derived(Math.max(graphWidth, laneCount * laneWidth + 16));
   const branchWidth = $derived(columns.branches ?? 150);
   const authorWidth = $derived(columns.author ?? 140);
-  const dateWidth = $derived(columns.date ?? 120);
+  const dateWidth = $derived(columns.date ?? COLUMN_LIMITS.date.initial);
   const subjectWidth = $derived(columns.subject ?? Math.max(200, viewportWidth - authorWidth - (searchActive ? 110 : graphWidth + branchWidth + dateWidth)));
   const tableWidth = $derived(subjectWidth + authorWidth + (searchActive ? 110 : graphWidth + branchWidth + dateWidth));
   const columnTemplate = $derived(`${searchActive ? "" : `${branchWidth}px ${graphWidth}px `}${subjectWidth}px ${authorWidth}px${searchActive ? " 110px" : ` ${dateWidth}px`}`);
@@ -420,6 +421,7 @@
       {#each visible as row, i (row.oid)}
         {@const laidRow = laidByOid.get(row.oid)}
         {@const badges = badgesFor(row)}
+        {@const committedAt = formatDateTime(row.committedAt)}
         <div class="gd-list-row" class:contexted={rowMenu?.row.oid === row.oid} role="listitem"
           aria-setsize={activeRows().length} aria-posinset={window.start + i + 1}
           oncontextmenu={(event) => openRowMenu(event, row)} onkeydown={(event) => rowMenuKey(event, row)}>
@@ -482,9 +484,9 @@
             </span>
             {/if}
             <span class="gd-subject" title={row.subject}>{#if row.boundary}<span title="Shallow boundary">◇ </span>{/if}{row.subject}</span>
-            <span class="gd-author" title={`${row.authorName} · ${row.committedAt} · ${row.oid}`}>{row.authorName}<small>{shortOid(row.oid)}</small></span>
+            <span class="gd-author" title={`${row.authorName} · ${committedAt} · ${row.oid}`}>{row.authorName}<small>{shortOid(row.oid)}</small></span>
             {#if !searchActive}
-              <span class="gd-date" title={row.committedAt}>{formatCommitDate(row.committedAt)}</span>
+              <span class="gd-date" title={committedAt}>{committedAt}</span>
             {/if}
           </button>
           {#if searchActive}<button class="gd-show-graph" onclick={() => onShowInGraph(row.oid)}>Show in graph</button>{/if}
@@ -512,7 +514,7 @@
   .gd-clear, .gd-show-graph, .gd-state button { background: var(--gd-panel); color: var(--gd-accent); border: 1px solid var(--gd-border); border-radius: 4px; padding: 4px 8px; cursor: pointer; font: inherit; }
   .gd-clear { margin-left: auto; }
   .gd-history-header, .gd-commit-row { display: grid; grid-template-columns: var(--history-columns); width: var(--history-width); }
-  .gd-history-header { position: sticky; top: 0; z-index: 3; height: 28px; background: var(--gd-panel); border-bottom: 1px solid var(--gd-border); color: var(--gd-text-secondary); font-size: var(--gd-font-size-small); }
+  .gd-history-header { position: sticky; top: 0; z-index: 3; height: 28px; grid-template-rows: minmax(0, 1fr); background: var(--gd-panel); border-bottom: 1px solid var(--gd-border); color: var(--gd-text-secondary); font-size: var(--gd-font-size-small); }
   .gd-workbar {
     display: flex;
     align-items: center;
@@ -540,11 +542,11 @@
   .gd-workbar .gd-modified { color: var(--gd-warning); }
   .gd-workbar .gd-deleted { color: var(--gd-danger); }
   .gd-workbar-go { color: var(--gd-text-secondary); }
-  .gd-column-head { position: relative; display: flex; align-items: center; min-width: 0; }
+  .gd-column-head { position: relative; display: flex; align-items: center; min-width: 0; min-height: 0; overflow: hidden; }
   .gd-column-head > span { padding-left: 12px; }
   .gd-graph-head { flex-direction: column; align-items: stretch; justify-content: space-between; }
-  .gd-graph-head > span { line-height: 17px; }
-  .gd-lane-scroll { width: 100%; height: 14px; overflow-x: scroll; overflow-y: hidden; }
+  .gd-graph-head > span { line-height: 14px; flex: 0 0 auto; }
+  .gd-lane-scroll { width: 100%; flex: 1 1 0; min-height: 0; overflow-x: scroll; overflow-y: hidden; }
   .gd-lane-scroll:focus-visible { outline: 2px solid var(--gd-focus); outline-offset: -2px; }
   .gd-viewport { flex: 1 1 0; overflow-x: scroll; overflow-y: auto; min-width: 0; min-height: 0; scrollbar-gutter: stable; }
   .gd-list-row { position: relative; width: var(--history-width); }
