@@ -12,8 +12,12 @@ import type {
   HistoryPage,
   HistoryScope,
   ConflictAcceptResult,
+  ConflictHunks,
+  ConflictAutoResolveResult,
   ConflictList,
+  ConflictMergeResult,
   ConflictPreview,
+  MergeBlockPick,
   MergeCompleteResult,
   MergeStartResult,
   SettingsV1,
@@ -428,6 +432,36 @@ export const realAdapter = {
       pathId,
       workingFingerprint,
       resolution
+    });
+  },
+  async conflictHunks(repoId: RepoId, pathId: string): Promise<ConflictHunks> {
+    return invokeCommand<ConflictHunks>("conflict_hunks", {
+      requestId: newRequestId(),
+      repoId,
+      pathId
+    });
+  },
+  async conflictMerge(
+    repoId: RepoId,
+    expectedVersion: number,
+    pathId: string,
+    workingFingerprint: string,
+    picks: MergeBlockPick[],
+    resultText: string | null = null
+  ): Promise<ConflictMergeResult> {
+    return invokeCommand<ConflictMergeResult>("conflict_merge", {
+      requestId: newRequestId(),
+      repoId,
+      expectedVersion,
+      pathId,
+      workingFingerprint,
+      picks,
+      resultText
+    });
+  },
+  async conflictAutoResolve(repoId: RepoId, expectedVersion: number, pathId: string, workingFingerprint: string): Promise<ConflictAutoResolveResult> {
+    return invokeCommand<ConflictAutoResolveResult>("conflict_auto_resolve", {
+      requestId: newRequestId(), repoId, expectedVersion, pathId, workingFingerprint
     });
   },
   async mergeStart(repoId: RepoId, expectedVersion: number, sourceRefId: string, confirmedTargetOid: string): Promise<MergeStartResult> {

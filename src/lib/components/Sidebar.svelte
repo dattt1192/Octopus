@@ -4,9 +4,9 @@
   // Context Menu key) menu wired to the real branch flows: switch, track,
   // show-in-graph, copy helpers and safe delete. No placeholder buttons.
   // P2 placeholders (FR-23/24): PRs "Planned", submodules read-only summary.
-  // Stash listing has no read IPC in this milestone, so the section carries
-  // an explanation instead of a fake count.
-  import type { RefItem } from "../ipc/types";
+  // The stashes section lists real entries with apply/pop restore through
+  // the shared stash flows; listing needs no trust, restore does.
+  import type { AppError, RefItem, StashEntry } from "../ipc/types";
   import ContextMenu from "./ContextMenu.svelte";
   import {
     isContextMenuKey,
@@ -33,6 +33,15 @@
     onSelect: (section: string) => void;
     onRefSelect: (refId: string) => void;
     onBranchAction: (action: BranchMenuAction, ref: RefItem) => void;
+    stashes: StashEntry[];
+    stashesLoading: boolean;
+    stashesError: AppError | null;
+    stashesNotice: string | null;
+    stashBusyEntry: string | null;
+    onStashApply: (entry: StashEntry) => void;
+    onStashPop: (entry: StashEntry) => void;
+    onStashManage: () => void;
+    onStashRetry: () => void;
   }
 
   let {
@@ -45,7 +54,16 @@
     selectedCommitOid,
     onSelect,
     onRefSelect,
-    onBranchAction
+    onBranchAction,
+    stashes,
+    stashesLoading,
+    stashesError,
+    stashesNotice,
+    stashBusyEntry,
+    onStashApply,
+    onStashPop,
+    onStashManage,
+    onStashRetry
   }: Props = $props();
 
   const localRefs = $derived(refs.filter((r) => r.kind === "local"));
@@ -108,6 +126,11 @@
   const remoteWindow = $derived(
     windowRows(shownRemote, remoteScrollTop, REF_VIEWPORT, REF_ROW_HEIGHT, REF_OVERSCAN)
   );
+
+  function createdLabel(createdAt: number): string {
+    if (!createdAt) return "unknown time";
+    return new Date(createdAt * 1000).toLocaleString();
+  }
 
   function refTitle(ref: RefItem): string {
     const parts = [ref.fullName, ref.oid.slice(0, 7)];
@@ -284,9 +307,12 @@
           type="button"
           class:active={activeSection === "stashes"}
           onclick={() => onSelect("stashes")}
-          title="Stash listing is not part of this milestone"
+          title="Stashed changes with apply/pop restore"
         >
           <span class="gd-section-label">Stashes</span>
+          {#if stashes.length > 0}
+            <span class="gd-count">{stashes.length}</span>
+          {/if}
         </button>
       </li>
       <li>
@@ -313,7 +339,59 @@
     </ul>
   </nav>
   {#if activeSection === "stashes"}
-    <p class="gd-note">Stash entries are not listed in this milestone. Stash apply/restore arrives with the worktree operations.</p>
+    {#if stashesLoading && stashes.length === 0}
+      <p class="gd-note" role="status">Loading stash…</p>
+    {:else}
+      {#if stashesNotice}<p class="gd-note" role="status">{stashesNotice}</p>{/if}
+      <div class="gd-stashes-bar">
+        <button
+          type="button"
+          class="gd-mini-btn"
+          title="Open the stash dialog (custom message, untracked files, full list)"
+          onclick={onStashManage}
+        >
+          Save stash…
+        </button>
+      </div>
+      {#if stashesError && stashes.length === 0}
+        <div class="gd-note" role="alert">
+          <p>Stash list failed ({stashesError.code}): {stashesError.message}</p>
+          <button type="button" class="gd-mini-btn" onclick={onStashRetry}>Retry</button>
+        </div>
+      {:else if stashes.length === 0}
+        <p class="gd-note">No stashed changes.</p>
+      {:else}
+        <ul class="gd-stashes" aria-label="Stash entries">
+          {#each stashes as entry (entry.stashId + entry.oid)}
+            <li>
+              <span class="gd-stash-id">{entry.stashId}</span>
+              <span class="gd-stash-label" title={entry.label}>{entry.label}</span>
+              <span class="gd-stash-meta">{entry.oid.slice(0, 8)} · {createdLabel(entry.createdAt)}</span>
+              <div class="gd-stash-actions">
+                <button
+                  type="button"
+                  class="gd-mini-btn"
+                  disabled={actionsDisabled || stashBusyEntry !== null}
+                  title={actionsDisabled ? "Trust this repository to restore stashes" : "Restore these changes, keep the entry"}
+                  onclick={() => onStashApply(entry)}
+                >
+                  {stashBusyEntry === `apply:${entry.stashId}` ? "Applying…" : "Apply"}
+                </button>
+                <button
+                  type="button"
+                  class="gd-mini-btn"
+                  disabled={actionsDisabled || stashBusyEntry !== null}
+                  title={actionsDisabled ? "Trust this repository to restore stashes" : "Restore these changes, drop the entry on success"}
+                  onclick={() => onStashPop(entry)}
+                >
+                  {stashBusyEntry === `pop:${entry.stashId}` ? "Popping…" : "Pop"}
+                </button>
+              </div>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    {/if}
   {:else if activeSection === "prs"}
     <p class="gd-note">Pull requests are planned after MVP. No provider data is shown.</p>
   {:else if activeSection === "submodules"}
@@ -481,4 +559,36 @@
     font-size: var(--gd-font-size-small);
     color: var(--gd-text-secondary);
   }
+  .gd-note p { margin: 0 0 var(--gd-space-2); }
+  .gd-stashes-bar {
+    display: flex;
+    justify-content: flex-end;
+    padding: 0 var(--gd-space-3) var(--gd-space-2);
+  }
+  .gd-stashes { list-style: none; margin: 0; padding: 0 0 var(--gd-space-2); }
+  .gd-stashes > li {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: var(--gd-space-2) var(--gd-space-3);
+    border-bottom: 1px solid var(--gd-border);
+  }
+  .gd-stash-id { font-family: var(--gd-font-code); font-size: var(--gd-font-size-small); }
+  .gd-stash-label { font-size: var(--gd-font-size-small); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .gd-stash-meta { font-size: var(--gd-font-size-small); color: var(--gd-text-secondary); }
+  .gd-stash-actions { display: flex; gap: var(--gd-space-1); margin-top: 4px; }
+  .gd-sidebar .gd-mini-btn {
+    flex: 0 0 auto;
+    width: auto;
+    padding: 2px 8px;
+    font-size: var(--gd-font-size-small);
+    color: var(--gd-text);
+    background: transparent;
+    border: 1px solid var(--gd-border);
+    border-radius: var(--gd-radius-control);
+    cursor: pointer;
+  }
+  .gd-sidebar .gd-mini-btn:hover:not(:disabled) { background: var(--gd-surface-hover); }
+  .gd-sidebar .gd-mini-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+  .gd-sidebar .gd-mini-btn:focus-visible { outline: 2px solid var(--gd-focus); outline-offset: 1px; }
 </style>

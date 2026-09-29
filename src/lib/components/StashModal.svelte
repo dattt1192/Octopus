@@ -39,6 +39,11 @@
     onClose
   }: Props = $props();
 
+  let messageInput: HTMLInputElement | undefined = $state();
+  $effect(() => {
+    messageInput?.focus();
+  });
+
   function keyDown(e: KeyboardEvent): void {
     if (e.key === "Escape") onClose();
   }
@@ -57,7 +62,21 @@
 
 <div class="gd-modal-backdrop">
   <div class="gd-modal gd-modal-wide" role="dialog" aria-modal="true" aria-label="Stash">
-    <h2>Stash</h2>
+    <div class="gd-modal-head">
+      <h2>Stash</h2>
+      {#if entries.length > 0}
+        <span class="gd-count">{entries.length}</span>
+      {/if}
+      <button
+        type="button"
+        class="gd-x"
+        aria-label="Close stash dialog"
+        title="Close (Esc)"
+        onclick={onClose}
+      >
+        ×
+      </button>
+    </div>
     {#if error}
       <p class="gd-error" role="alert">{errorText(error)}</p>
     {/if}
@@ -66,38 +85,38 @@
     {/if}
 
     <section aria-label="Save stash">
-      <h3>Save working changes</h3>
-      <label class="gd-field">
-        <span>Message (optional)</span>
+      <div class="gd-save-row">
         <input
           type="text"
+          bind:this={messageInput}
           value={message}
           maxlength={500}
-          placeholder="WIP on current branch"
+          placeholder="Message (optional)"
+          aria-label="Stash message (optional)"
           oninput={(e) => onMessage(e.currentTarget.value)}
         />
-      </label>
-      <label class="gd-check">
+        <button
+          type="button"
+          class="gd-primary"
+          disabled={saveBusy || saveDisabledReason !== null}
+          title={saveDisabledReason ?? "Stash current changes (apply without --index on restore)"}
+          onclick={onSave}
+        >
+          {saveBusy ? "Stashing…" : "Stash"}
+        </button>
+      </div>
+      <label class="gd-check" title="Ignored files are never stashed">
         <input
           type="checkbox"
           checked={includeUntracked}
           onchange={(e) => onIncludeUntracked(e.currentTarget.checked)}
         />
-        Include untracked files (tracked-only by default; ignored files never stashed)
+        Include untracked files
       </label>
-      <button
-        type="button"
-        class="gd-primary"
-        disabled={saveBusy || saveDisabledReason !== null}
-        title={saveDisabledReason ?? "Stash current changes (apply without --index on restore)"}
-        onclick={onSave}
-      >
-        {saveBusy ? "Stashing…" : "Stash"}
-      </button>
     </section>
 
     <section aria-label="Stashed entries">
-      <h3>Stashed ({entries.length})</h3>
+      <h3>Stashed</h3>
       {#if loading && entries.length === 0}
         <p class="gd-muted" role="status">Loading stash…</p>
       {:else if entries.length === 0}
@@ -106,38 +125,34 @@
         <ul class="gd-stash-list">
           {#each entries as entry (entry.stashId + entry.oid)}
             <li>
-              <div class="gd-stash-meta">
+              <div class="gd-stash-top">
                 <span class="gd-stash-id">{entry.stashId}</span>
-                <span class="gd-stash-label">{entry.label}</span>
-                <span class="gd-muted">{entry.oid.slice(0, 8)} · {createdLabel(entry.createdAt)}</span>
+                <span class="gd-stash-label" title={entry.label}>{entry.label}</span>
+                <div class="gd-stash-actions">
+                  <button
+                    type="button"
+                    disabled={busyEntry !== null}
+                    title="Restore these changes, keep the entry"
+                    onclick={() => onApply(entry)}
+                  >
+                    {busyEntry === `apply:${entry.stashId}` ? "Applying…" : "Apply"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busyEntry !== null}
+                    title="Restore these changes, drop the entry on success"
+                    onclick={() => onPop(entry)}
+                  >
+                    {busyEntry === `pop:${entry.stashId}` ? "Popping…" : "Pop"}
+                  </button>
+                </div>
               </div>
-              <div class="gd-stash-actions">
-                <button
-                  type="button"
-                  disabled={busyEntry !== null}
-                  title="Restore these changes, keep the entry"
-                  onclick={() => onApply(entry)}
-                >
-                  {busyEntry === `apply:${entry.stashId}` ? "Applying…" : "Apply"}
-                </button>
-                <button
-                  type="button"
-                  disabled={busyEntry !== null}
-                  title="Restore these changes, drop the entry on success"
-                  onclick={() => onPop(entry)}
-                >
-                  {busyEntry === `pop:${entry.stashId}` ? "Popping…" : "Pop"}
-                </button>
-              </div>
+              <div class="gd-muted">{entry.oid.slice(0, 8)} · {createdLabel(entry.createdAt)}</div>
             </li>
           {/each}
         </ul>
       {/if}
     </section>
-
-    <div class="gd-modal-foot">
-      <button type="button" onclick={onClose}>Close</button>
-    </div>
   </div>
 </div>
 
@@ -161,13 +176,36 @@
     max-height: 80vh;
     overflow-y: auto;
   }
-  .gd-modal h2 {
-    margin: 0 0 var(--gd-space-3);
+  .gd-modal-head {
+    display: flex;
+    align-items: center;
+    gap: var(--gd-space-2);
+    margin-bottom: var(--gd-space-3);
+  }
+  .gd-modal-head h2 {
+    margin: 0;
     font-size: 15px;
   }
-  .gd-modal h3 {
-    margin: var(--gd-space-3) 0 var(--gd-space-2);
-    font-size: 13px;
+  .gd-count {
+    border: 1px solid var(--gd-border);
+    border-radius: var(--gd-radius-control);
+    color: var(--gd-accent);
+    padding: 0 7px;
+    font-size: var(--gd-font-size-small);
+    line-height: 1.6;
+  }
+  .gd-x {
+    margin-left: auto;
+    background: transparent;
+    border: none;
+    color: var(--gd-text-secondary);
+    font-size: 18px;
+    line-height: 1;
+    padding: 2px 6px;
+    cursor: pointer;
+  }
+  .gd-x:hover {
+    color: var(--gd-text);
   }
   .gd-error {
     color: var(--gd-danger);
@@ -181,14 +219,17 @@
     color: var(--gd-text-secondary);
     font-size: var(--gd-font-size-small);
   }
-  .gd-field {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    margin-bottom: var(--gd-space-2);
-    font-size: var(--gd-font-size-small);
+  .gd-modal h3 {
+    margin: var(--gd-space-3) 0 var(--gd-space-2);
+    font-size: 13px;
   }
-  .gd-field input {
+  .gd-save-row {
+    display: flex;
+    gap: var(--gd-space-2);
+  }
+  .gd-save-row input {
+    flex: 1;
+    min-width: 0;
     background: var(--gd-background);
     border: 1px solid var(--gd-border);
     border-radius: var(--gd-radius-control);
@@ -198,39 +239,40 @@
   .gd-check {
     display: flex;
     gap: var(--gd-space-2);
-    align-items: flex-start;
+    align-items: center;
     font-size: var(--gd-font-size-small);
-    margin-bottom: var(--gd-space-2);
+    margin-top: var(--gd-space-2);
   }
   .gd-primary {
     padding: 6px 14px;
     cursor: pointer;
+    white-space: nowrap;
   }
   .gd-stash-list {
     list-style: none;
     margin: 0;
     padding: 0;
-    display: flex;
-    flex-direction: column;
-    gap: var(--gd-space-2);
   }
   .gd-stash-list li {
-    border: 1px solid var(--gd-border);
-    border-radius: var(--gd-radius-control);
-    padding: var(--gd-space-2) var(--gd-space-3);
+    padding: var(--gd-space-2) 0;
+    border-top: 1px solid var(--gd-border);
   }
-  .gd-stash-meta {
+  .gd-stash-list li:last-child {
+    border-bottom: 1px solid var(--gd-border);
+  }
+  .gd-stash-top {
     display: flex;
     gap: var(--gd-space-2);
-    align-items: baseline;
-    font-size: var(--gd-font-size-small);
+    align-items: center;
   }
   .gd-stash-id {
     color: var(--gd-text-secondary);
     white-space: nowrap;
+    font-size: var(--gd-font-size-small);
   }
   .gd-stash-label {
     flex: 1;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -238,11 +280,6 @@
   .gd-stash-actions {
     display: flex;
     gap: var(--gd-space-2);
-    margin-top: var(--gd-space-1);
-  }
-  .gd-modal-foot {
-    display: flex;
-    justify-content: flex-end;
-    margin-top: var(--gd-space-3);
+    margin-left: auto;
   }
 </style>

@@ -17,7 +17,7 @@ use crate::domain::{
 };
 use crate::git::{
     ahead_behind, classify_network_stderr, parse_progress_line, redact_url, resolve_upstream,
-    validate_remote_url, GitRunner, NetworkFault, NETWORK_TIMEOUT,
+    validate_remote_url, GitRunner, NetworkFault, UpstreamRef, NETWORK_TIMEOUT,
 };
 use crate::services::RepoRegistry;
 
@@ -632,6 +632,87 @@ async fn core_fetch(
     Ok(OperationStarted { operation_id })
 }
 
+/// Adopt `remote/branch` as the upstream of the current branch when the branch
+/// has no upstream yet and the same-named tracking ref exists on `remote`
+/// (the `git branch --set-upstream-to` recovery git itself suggests).
+/// Returns the resolved upstream after adoption, or `None` when adoption does
+/// not apply. Existing tracking configuration is never overwritten, and a
+/// detached HEAD is never linked.
+async fn adopt_same_name_upstream(
+    runner: &GitRunner,
+    worktree: &std::path::Path,
+    remote: &str,
+) -> Option<UpstreamRef> {
+    if check_remote_name(remote).is_err() {
+        return None;
+    }
+    let head = runner
+        .run(
+            worktree,
+            &["symbolic-ref", "-q", "--short", "HEAD"],
+            crate::git::READ_TIMEOUT,
+        )
+        .await
+        .ok()?;
+    if !head.success {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    if branch.is_empty() {
+        return None;
+    }
+    // Fail closed when any tracking configuration already exists.
+    for suffix in ["remote", "merge"] {
+        let key = format!("branch.{branch}.{suffix}");
+        let configured = runner
+            .run(
+                worktree,
+                &["config", "--get", &key],
+                crate::git::READ_TIMEOUT,
+            )
+            .await
+            .ok()?;
+        if configured.success
+            && !String::from_utf8_lossy(&configured.stdout)
+                .trim()
+                .is_empty()
+        {
+            return None;
+        }
+    }
+    // The same-named tracking ref must already exist (fetched); adoption
+    // never invents an upstream.
+    let tracking = format!("refs/remotes/{remote}/{branch}");
+    let exists = runner
+        .run(
+            worktree,
+            &["rev-parse", "--verify", "--quiet", &tracking],
+            crate::git::READ_TIMEOUT,
+        )
+        .await
+        .ok()?;
+    if !exists.success {
+        return None;
+    }
+    let linked = runner
+        .run(
+            worktree,
+            &[
+                "branch",
+                "--set-upstream-to",
+                &format!("{remote}/{branch}"),
+                &branch,
+            ],
+            crate::git::WRITE_TIMEOUT,
+        )
+        .await
+        .ok()?;
+    if !linked.success {
+        return None;
+    }
+    resolve_upstream(runner, worktree).await.ok()?
+}
+
 async fn core_pull(
     app: &AppHandle,
     runner: &GitRunner,
@@ -663,6 +744,15 @@ async fn core_pull(
     let upstream = resolve_upstream(runner, &session.worktree_root)
         .await
         .map_err(|_| bad_request("Cannot read the upstream"))?;
+    // No upstream (e.g. checked out from a remote onto an untracked twin):
+    // adopt the same-named tracking ref on the default remote, mirroring
+    // push's `--set-upstream` recovery, instead of dead-ending.
+    let mut upstream = upstream;
+    if upstream.is_none() {
+        if let Ok(remote) = default_remote(runner, registry, repo_id).await {
+            upstream = adopt_same_name_upstream(runner, &session.worktree_root, &remote).await;
+        }
+    }
     let upstream =
         upstream.ok_or_else(|| bad_request("No upstream configured for the current branch"))?;
     // Backend enforces ff-only regardless of repo config.
@@ -1270,18 +1360,54 @@ async fn check_branch_name(
     Ok(trimmed.to_string())
 }
 
+/// Preserve the HTTPS credential context, including account, port and `.git`
+/// path. Git itself applies URL-scoped helper settings and useHttpPath.
+/// SCP remotes use the corresponding HTTPS URL without the SSH login (`git`).
+fn pr_credential_url(remote_url: &str) -> Result<String, AppError> {
+    let url = remote_url.trim();
+    if url.chars().any(char::is_control)
+        || validate_remote_url(url).is_err()
+        || detect_pr_provider(url).is_none()
+    {
+        return Err(bad_request(
+            "Cannot determine the pull request credential context",
+        ));
+    }
+    if let Some((scheme, rest)) = url.split_once("://") {
+        if scheme.eq_ignore_ascii_case("https") {
+            return Ok(format!(
+                "https://{}",
+                rest.split(['?', '#']).next().unwrap_or("")
+            ));
+        }
+    } else if let Some((_, rest)) = url.split_once('@') {
+        if let Some((host, path)) = rest.split_once(':') {
+            return Ok(format!(
+                "https://{host}/{}",
+                path.split(['?', '#']).next().unwrap_or("")
+            ));
+        }
+    }
+    Err(bad_request(
+        "Cannot determine the pull request credential context",
+    ))
+}
+
 /// Read a saved credential back via `git credential fill` (non-interactive;
-/// never prompts). Returns `(username, password)`.
+/// never prompts). Returns `(username, password)`. The URL and helper output
+/// stay inside the backend; no secret is included in argv or error messages.
 async fn pr_credential(
     runner: &GitRunner,
     cwd: &std::path::Path,
-    host: &str,
+    remote_url: &str,
 ) -> Result<(String, String), AppError> {
-    let input = format!("protocol=https\nhost={host}\n\n");
+    let input = format!("url={}\n\n", pr_credential_url(remote_url)?);
+    // Match the account selected by Bitbucket Connect and HTTPS sync.
+    let argv = with_bitbucket_username(remote_url, vec!["credential".into(), "fill".into()]);
     let out = runner
         .run_with_stdin(
             cwd,
-            &["credential", "fill"],
+            &argv,
             input.as_bytes(),
             std::time::Duration::from_secs(15),
         )
@@ -1552,8 +1678,7 @@ async fn core_pull_request_create(
     } else {
         check_pr_text(&request.description, "Description", 65536)?
     };
-    let host = raw_url_host(&raw_url).unwrap_or_default();
-    let (_username, password) = pr_credential(runner, cwd, &host).await?;
+    let (_username, password) = pr_credential(runner, cwd, &raw_url).await?;
     let endpoint = pr_endpoint(&coords);
     let payload = pr_request_json(coords.provider, &title, &description, &source, &target);
     let mut builder = http
@@ -1600,28 +1725,6 @@ async fn core_pull_request_create(
         url,
         reference,
     })
-}
-
-/// Host part of an HTTPS or SSH remote URL, lowercased.
-fn raw_url_host(remote_url: &str) -> Option<String> {
-    if let Some(after_at) = remote_url.split_once('@') {
-        let (host, _) = after_at.1.split_once(':')?;
-        if host.is_empty() {
-            return None;
-        }
-        return Some(host.to_ascii_lowercase());
-    }
-    let (_, rest) = remote_url.split_once("://")?;
-    let rest = rest
-        .rsplit_once('@')
-        .map(|(_, after)| after)
-        .unwrap_or(rest);
-    let authority = rest.split('/').next().unwrap_or("");
-    let host = authority.split(':').next().unwrap_or("");
-    if host.is_empty() {
-        return None;
-    }
-    Some(host.to_ascii_lowercase())
 }
 
 /// Create a pull (merge) request on the hosting provider. External write:
@@ -1685,7 +1788,152 @@ pub mod prelude {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::commit::tests::{git, temp_repo};
     use std::sync::atomic::AtomicBool;
+
+    fn config_get(repo: &std::path::Path, key: &str) -> Option<String> {
+        let out = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(["config", "--get", key])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git config");
+        if !out.status.success() {
+            return None;
+        }
+        let value = String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .to_string();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    fn publish_branch(repo: &std::path::Path, branch: &str) {
+        git(repo, &["checkout", "-b", branch]);
+        git(repo, &["commit", "--allow-empty", "-m", branch]);
+        git(repo, &["push", "origin", branch]);
+    }
+
+    #[tokio::test]
+    async fn pull_adopts_same_name_tracking_ref_for_untracked_twin() {
+        let (_dir, repo) = temp_repo("pull-adopt-twin");
+        git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        let bare = repo.parent().expect("parent").join("remote.git");
+        git(&repo, &["init", "--bare", bare.to_str().expect("path")]);
+        git(
+            &repo,
+            &["remote", "add", "origin", bare.to_str().expect("path")],
+        );
+        git(&repo, &["push", "origin", "main"]);
+        // Same-named ref on origin, but the local twin tracks nothing:
+        // `git push` without `-u` leaves the branch unlinked.
+        publish_branch(&repo, "feature");
+
+        let runner = git_runner().expect("system git");
+        let before = resolve_upstream(&runner, &repo)
+            .await
+            .expect("upstream read");
+        assert!(
+            before.is_none(),
+            "twin without upstream is the bug precondition"
+        );
+
+        let adopted = adopt_same_name_upstream(&runner, &repo, "origin").await;
+        let upstream = adopted.expect("adopts origin/feature");
+        assert_eq!(upstream.remote, "origin");
+        assert_eq!(upstream.full_name, "refs/remotes/origin/feature");
+        assert_eq!(
+            config_get(&repo, "branch.feature.remote").as_deref(),
+            Some("origin")
+        );
+        assert_eq!(
+            config_get(&repo, "branch.feature.merge").as_deref(),
+            Some("refs/heads/feature")
+        );
+
+        let after = resolve_upstream(&runner, &repo)
+            .await
+            .expect("upstream read");
+        assert_eq!(
+            after.map(|u| u.full_name).as_deref(),
+            Some("refs/remotes/origin/feature")
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_adoption_leaves_configured_upstream_alone() {
+        let (_dir, repo) = temp_repo("pull-adopt-keeps");
+        git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        let bare = repo.parent().expect("parent").join("remote.git");
+        git(&repo, &["init", "--bare", bare.to_str().expect("path")]);
+        git(
+            &repo,
+            &["remote", "add", "origin", bare.to_str().expect("path")],
+        );
+        git(&repo, &["push", "-u", "origin", "main"]);
+        let other = repo.parent().expect("parent").join("other.git");
+        git(&repo, &["init", "--bare", other.to_str().expect("path")]);
+        git(
+            &repo,
+            &["remote", "add", "other", other.to_str().expect("path")],
+        );
+        git(&repo, &["push", "other", "main"]);
+        git(&repo, &["fetch", "other"]);
+
+        let runner = git_runner().expect("system git");
+        let adopted = adopt_same_name_upstream(&runner, &repo, "other").await;
+        assert!(
+            adopted.is_none(),
+            "existing upstream must never be overwritten"
+        );
+        assert_eq!(
+            config_get(&repo, "branch.main.remote").as_deref(),
+            Some("origin")
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_adoption_needs_the_tracking_ref() {
+        let (_dir, repo) = temp_repo("pull-adopt-missing");
+        git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        let bare = repo.parent().expect("parent").join("remote.git");
+        git(&repo, &["init", "--bare", bare.to_str().expect("path")]);
+        git(
+            &repo,
+            &["remote", "add", "origin", bare.to_str().expect("path")],
+        );
+        git(&repo, &["push", "origin", "main"]);
+        git(&repo, &["checkout", "-b", "lonely"]);
+        git(&repo, &["commit", "--allow-empty", "-m", "lonely"]);
+
+        let runner = git_runner().expect("system git");
+        let adopted = adopt_same_name_upstream(&runner, &repo, "origin").await;
+        assert!(adopted.is_none(), "no origin/lonely exists to adopt");
+        assert!(config_get(&repo, "branch.lonely.remote").is_none());
+        assert!(config_get(&repo, "branch.lonely.merge").is_none());
+    }
+
+    #[tokio::test]
+    async fn pull_adoption_refuses_detached_head() {
+        let (_dir, repo) = temp_repo("pull-adopt-detached");
+        git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        let bare = repo.parent().expect("parent").join("remote.git");
+        git(&repo, &["init", "--bare", bare.to_str().expect("path")]);
+        git(
+            &repo,
+            &["remote", "add", "origin", bare.to_str().expect("path")],
+        );
+        git(&repo, &["push", "origin", "main"]);
+        git(&repo, &["checkout", "--detach", "HEAD"]);
+
+        let runner = git_runner().expect("system git");
+        let adopted = adopt_same_name_upstream(&runner, &repo, "origin").await;
+        assert!(adopted.is_none(), "detached HEAD has no branch to link");
+    }
 
     fn preset() -> std::sync::Arc<AtomicBool> {
         std::sync::Arc::new(AtomicBool::new(false))
@@ -2062,6 +2310,134 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn pr_credential_urls_preserve_https_context_and_translate_ssh() {
+        for (remote, expected) in [
+            (
+                "https://octo@bitbucket.org/acme/widgets.git",
+                "https://octo@bitbucket.org/acme/widgets.git",
+            ),
+            (
+                "https://octo@bitbucket.org:443/acme/widgets.git",
+                "https://octo@bitbucket.org:443/acme/widgets.git",
+            ),
+            (
+                "https://user%40example.com@gitlab.com/group/sub/widgets.git?ignored=yes#fragment",
+                "https://user%40example.com@gitlab.com/group/sub/widgets.git",
+            ),
+            (
+                "git@github.com:acme/widgets.git",
+                "https://github.com/acme/widgets.git",
+            ),
+        ] {
+            assert_eq!(pr_credential_url(remote).expect("credential URL"), expected);
+        }
+        for remote in [
+            "https://octo:secret@bitbucket.org/acme/widgets.git",
+            "https://bitbucket.org/acme/widgets.git\nhost=evil.example",
+            "https://example.com/acme/widgets.git",
+            "http://github.com/acme/widgets.git",
+            "",
+        ] {
+            assert!(pr_credential_url(remote).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn pr_credential_matches_named_bitbucket_https_remote() {
+        let (dir, repo) = temp_repo(&format!("pr-named-{}", uuid::Uuid::new_v4()));
+        git(
+            &repo,
+            &["config", "--local", "--add", "credential.helper", ""],
+        );
+        let helper = format!("store --file={}", dir.join("credentials").display());
+        git(
+            &repo,
+            &["config", "--local", "--add", "credential.helper", &helper],
+        );
+        git(&repo, &["config", "credential.useHttpPath", "true"]);
+        let remote = "https://octo@bitbucket.org/acme/widgets.git";
+        let context = bitbucket_credential_context(remote).expect("HTTPS credential context");
+        let runner = git_runner().expect("Git runner");
+        let approved = runner
+            .run_with_stdin(
+                &repo,
+                &["credential", "approve"],
+                &bitbucket_credential_payload(&context, "fixture-named-token").expect("payload"),
+                crate::git::WRITE_TIMEOUT,
+            )
+            .await
+            .expect("approve fixture");
+        assert!(approved.success);
+        // More recent entries must not win over the remote's account/path.
+        for (username, path) in [
+            ("someone-else", "acme/widgets.git"),
+            ("octo", "acme/other.git"),
+        ] {
+            let decoy = BitbucketCredentialContext {
+                username: username.into(),
+                path: path.into(),
+                ..context.clone()
+            };
+            let approved = runner
+                .run_with_stdin(
+                    &repo,
+                    &["credential", "approve"],
+                    &bitbucket_credential_payload(&decoy, "fixture-wrong-token")
+                        .expect("decoy payload"),
+                    crate::git::WRITE_TIMEOUT,
+                )
+                .await
+                .expect("approve decoy");
+            assert!(approved.success);
+        }
+        let result = pr_credential(&runner, &repo, remote).await;
+        let missing = pr_credential(
+            &runner,
+            &repo,
+            "https://octo@bitbucket.org/acme/missing.git",
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(
+            result.expect("saved named HTTPS credential").1,
+            "fixture-named-token"
+        );
+        let error = missing.expect_err("must not fall back to a different repo/account");
+        assert_eq!(error.code, ErrorCode::AUTH_REQUIRED);
+        assert!(!error.message.contains("fixture-"));
+    }
+
+    #[tokio::test]
+    async fn pr_credential_reuses_bitbucket_connect_default_account() {
+        let (dir, repo) = temp_repo(&format!("pr-default-{}", uuid::Uuid::new_v4()));
+        git(&repo, &["config", "--add", "credential.helper", ""]);
+        let helper = format!("store --file={}", dir.join("credentials").display());
+        git(&repo, &["config", "--add", "credential.helper", &helper]);
+        git(&repo, &["config", "credential.useHttpPath", "true"]);
+        let remote = "https://bitbucket.org/acme/widgets.git";
+        let context = bitbucket_credential_context(remote).expect("Connect context");
+        let runner = git_runner().expect("Git runner");
+        assert!(
+            runner
+                .run_with_stdin(
+                    &repo,
+                    &["credential", "approve"],
+                    &bitbucket_credential_payload(&context, "fixture-default-token")
+                        .expect("payload"),
+                    crate::git::WRITE_TIMEOUT,
+                )
+                .await
+                .expect("approve")
+                .success
+        );
+        let result = pr_credential(&runner, &repo, remote).await;
+        let _ = std::fs::remove_dir_all(dir);
+        let (username, token) = result.expect("Connect credential");
+        assert_eq!(username, BITBUCKET_STATIC_USERNAME);
+        assert_eq!(token, "fixture-default-token");
+    }
+
     #[tokio::test]
     async fn pr_credential_fill_reads_an_isolated_helper_entry() {
         use std::process::Command as StdCommand;
@@ -2086,6 +2462,7 @@ mod tests {
         git(&["config", "--local", "--add", "credential.helper", ""]);
         let helper = format!("store --file={}", helper_file.display());
         git(&["config", "--local", "--add", "credential.helper", &helper]);
+        git(&["config", "--local", "credential.useHttpPath", "false"]);
 
         let runner = git_runner().expect("Git runner");
         let approved = runner
@@ -2099,86 +2476,169 @@ mod tests {
             .expect("approve credential");
         assert!(approved.success);
 
-        let (username, password) = pr_credential(&runner, &root, "github.com")
-            .await
-            .expect("fill credential");
+        let (username, password) =
+            pr_credential(&runner, &root, "https://github.com/acme/widgets.git")
+                .await
+                .expect("fill credential");
         assert_eq!(username, "octo");
         assert_eq!(password, "fixture-pat-123");
-        assert!(pr_credential(&runner, &root, "unknown.example")
+        let ssh = pr_credential(&runner, &root, "git@github.com:acme/widgets.git")
             .await
-            .is_err());
+            .expect("SSH uses the saved HTTPS account, not the SSH login");
+        assert_eq!(ssh, (username, password));
+        assert!(
+            pr_credential(&runner, &root, "https://gitlab.com/acme/widgets.git")
+                .await
+                .is_err()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// End-to-end POST against a loopback stub: asserts method, path, auth
-    /// header and payload, then serves a canned provider response.
+    /// Exercise the production flow, including remote selection and credential
+    /// lookup, against loopback only. All accounts/tokens belong to fixtures.
     #[tokio::test]
-    async fn pr_create_posts_github_shape_to_a_stub_server() {
+    async fn pr_create_uses_saved_credentials_through_provider_flow() {
         use std::io::{Read, Write};
-        use std::sync::{Arc, Mutex};
 
-        let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let seen_server = Arc::clone(&seen);
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback stub listener");
-        let port = listener.local_addr().expect("stub port").port();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("stub accept");
-            let mut buffer = vec![0u8; 8192];
-            let read = stream.read(&mut buffer).expect("stub read");
-            seen_server
-                .lock()
-                .expect("stub lock")
-                .extend_from_slice(&buffer[..read]);
-            let body = r#"{"html_url":"https://github.com/acme/widgets/pull/7","number":7}"#;
-            let response = format!(
-                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
+        for (host, provider, endpoint, body, reference) in [
+            (
+                "github.com",
+                "github",
+                "/repos/acme/widgets/pulls",
+                r#"{"html_url":"https://github.com/acme/widgets/pull/7","number":7}"#,
+                "#7",
+            ),
+            (
+                "bitbucket.org",
+                "bitbucket",
+                "/repositories/acme/widgets/pullrequests",
+                r#"{"links":{"html":{"href":"https://bitbucket.org/acme/widgets/pull-requests/9"}},"id":9}"#,
+                "#9",
+            ),
+            (
+                "gitlab.com",
+                "gitlab",
+                "/projects/acme%2Fwidgets/merge_requests",
+                r#"{"web_url":"https://gitlab.com/acme/widgets/-/merge_requests/3","iid":3}"#,
+                "!3",
+            ),
+        ] {
+            let (dir, repo) = temp_repo(&format!("pr-flow-{}", uuid::Uuid::new_v4()));
+            let remote = format!("https://octo@{host}/acme/widgets.git");
+            git(&repo, &["remote", "add", "origin", &remote]);
+            git(&repo, &["config", "--add", "credential.helper", ""]);
+            // A URL-scoped helper catches lookups that lose the repository path.
+            let helper_key = format!("credential.https://{host}/acme/widgets.git.helper");
+            let helper = format!("store --file={}", dir.join("credentials").display());
+            git(&repo, &["config", "--add", &helper_key, &helper]);
+            git(&repo, &["config", "credential.useHttpPath", "true"]);
+            let runner = git_runner().expect("Git runner");
+            let payload = format!("protocol=https\nhost={host}\npath=acme/widgets.git\nusername=octo\npassword=fixture-pat-123\n\n");
+            assert!(
+                runner
+                    .run_with_stdin(
+                        &repo,
+                        &["credential", "approve"],
+                        payload.as_bytes(),
+                        crate::git::WRITE_TIMEOUT
+                    )
+                    .await
+                    .expect("approve fixture")
+                    .success
             );
-            stream.write_all(response.as_bytes()).expect("stub write");
-        });
 
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("stub http client");
-        let coords = PrCoords {
-            provider: PrProvider::GitHub,
-            api_base: format!("http://127.0.0.1:{port}"),
-            namespace: "acme".to_string(),
-            repo: "widgets".to_string(),
-        };
-        let endpoint = pr_endpoint(&coords);
-        assert_eq!(
-            endpoint,
-            format!("http://127.0.0.1:{port}/repos/acme/widgets/pulls")
-        );
-        let response = http
-            .post(&endpoint)
-            .header("User-Agent", "Octopus/0.1")
-            .header("Accept", "application/json")
-            .bearer_auth("fixture-pat-123")
-            .json(&pr_request_json(
-                PrProvider::GitHub,
-                "T",
-                "D",
-                "feat",
-                "main",
-            ))
-            .send()
-            .await
-            .expect("stub post");
-        assert_eq!(response.status(), reqwest::StatusCode::CREATED);
-        let body = response.bytes().await.expect("stub body");
-        let (url, reference) = pr_parse_response(PrProvider::GitHub, &body).expect("stub parse");
-        assert_eq!(url, "https://github.com/acme/widgets/pull/7");
-        assert_eq!(reference, "#7");
-        server.join().expect("stub server");
-        let raw = String::from_utf8(seen.lock().expect("stub lock").clone()).expect("stub text");
-        assert!(raw.starts_with("POST /repos/acme/widgets/pulls HTTP/1.1"));
-        assert!(raw.contains("authorization: Bearer fixture-pat-123"));
-        assert!(!raw.to_lowercase().contains("password"));
-        assert!(raw.contains(r#""head":"feat""#));
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("loopback stub listener");
+            let port = listener.local_addr().expect("stub port").port();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("stub accept");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .expect("read timeout");
+                let mut raw = Vec::new();
+                loop {
+                    let mut buffer = [0u8; 4096];
+                    let read = stream.read(&mut buffer).expect("stub read");
+                    assert!(read > 0, "incomplete HTTP request");
+                    raw.extend_from_slice(&buffer[..read]);
+                    assert!(raw.len() < 16384, "fixture request bound");
+                    if let Some(end) = raw.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .expect("content length")
+                            .trim()
+                            .parse()
+                            .expect("numeric length");
+                        if raw.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                stream.write_all(response.as_bytes()).expect("stub write");
+                String::from_utf8(raw).expect("stub request")
+            });
+            let http = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("stub client");
+            let mut registry = RepoRegistry::default();
+            let repo_id = crate::commands::commit::tests::open_repo(
+                &mut registry,
+                &repo,
+                TrustState::Trusted,
+            );
+            let request = PullRequestCreateRequest {
+                request_id: "fixture-pr".into(),
+                repo_id,
+                expected_version: 1,
+                remote: None,
+                source_branch: "feat".into(),
+                target_branch: "main".into(),
+                title: "T".into(),
+                description: "D".into(),
+            };
+            let result = core_pull_request_create(
+                &runner,
+                &registry,
+                &http,
+                Some(&format!("http://127.0.0.1:{port}")),
+                &request,
+                &repo,
+            )
+            .await;
+            let _ = std::fs::remove_dir_all(dir);
+            let result = result.expect("create with the remote's saved credential");
+            assert_eq!(result.provider, provider);
+            assert_eq!(result.reference, reference);
+            assert!(result
+                .url
+                .starts_with(&format!("https://{host}/acme/widgets/")));
+            let raw = server.join().expect("stub server");
+            assert!(raw.starts_with(&format!("POST {endpoint} HTTP/1.1")));
+            let (headers, request_body) = raw.split_once("\r\n\r\n").expect("HTTP body");
+            let auth = if provider == "gitlab" {
+                "private-token: fixture-pat-123"
+            } else {
+                "authorization: Bearer fixture-pat-123"
+            };
+            assert!(headers.contains(auth));
+            assert!(!request_body.contains("fixture-pat-123"));
+            let json: serde_json::Value = serde_json::from_str(request_body).expect("JSON payload");
+            assert_eq!(json["title"], "T");
+            let source = match provider {
+                "github" => &json["head"],
+                "bitbucket" => &json["source"]["branch"]["name"],
+                _ => &json["source_branch"],
+            };
+            assert_eq!(source, "feat");
+        }
     }
 
     #[test]

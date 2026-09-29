@@ -5,6 +5,7 @@
   // topology never share a gutter, so topology cannot leak into results.
   import { onMount, untrack } from "svelte";
   import type { AppError, CommitRow, RefItem } from "../ipc/types";
+  import type { WorkingSummary } from "../status/partition";
   import { windowRows, type LaidRow } from "../graph/layout";
 
   import ColumnResize from "./ColumnResize.svelte";
@@ -58,6 +59,9 @@
     branchActionsDisabled: boolean;
     /** When set, right-clicking a branch badge opens the branch menu. */
     onBranchAction?: (action: BranchMenuAction, ref: RefItem) => void;
+    /** Working-changes summary pinned under the header; null hides the bar. */
+    workBar?: WorkingSummary | null;
+    onOpenWorkingChanges?: () => void;
   }
 
   let {
@@ -74,6 +78,8 @@
     refLabels,
     refs = [],
     scopeValue,
+    scopeOptions,
+    onScopeChange,
     searchActive,
     searchQuery,
     searchRows,
@@ -91,7 +97,9 @@
     onRetry,
     onLoadMore,
     branchActionsDisabled,
-    onBranchAction
+    onBranchAction,
+    workBar = null,
+    onOpenWorkingChanges
   }: Props = $props();
 
   const rowHeight = 28;
@@ -342,6 +350,21 @@
 </script>
 
 <section class="gd-history" aria-label="Commit history" style={`--history-width: ${tableWidth}px; --history-columns: ${columnTemplate}`}>
+  <div class="gd-history-bar">
+    <div class="gd-scope">
+      <label for="gd-history-scope">Showing</label>
+      <select
+        id="gd-history-scope"
+        value={scopeValue}
+        onchange={(e) => onScopeChange(e.currentTarget.value)}
+      >
+        {#each scopeOptions as option (option.value)}
+          <option value={option.value}>{option.label}</option>
+        {/each}
+      </select>
+    </div>
+    <span class="gd-total">{totalHint}</span>
+  </div>
   <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions: keyboard navigation in virtual commit list -->
   <div class="gd-viewport" role="region" aria-label="Scrollable commit history"
     onscroll={onScroll} onkeydown={onViewportKeyDown} tabindex="0" bind:clientHeight={viewportHeight} bind:clientWidth={viewportWidth} bind:this={viewportEl}>
@@ -365,6 +388,23 @@
       {/each}
       {#if searchActive}<span></span>{/if}
     </div>
+    {#if workBar}
+      <button
+        type="button"
+        class="gd-workbar"
+        title="Open working changes"
+        aria-label={`${workBar.total} uncommitted changes. Open working changes.`}
+        onclick={() => onOpenWorkingChanges?.()}
+      >
+        <strong>{workBar.total} changed</strong>
+        <span class="gd-workbar-stats">
+          {#if workBar.added}<span class="gd-added">+{workBar.added} added</span>{/if}
+          {#if workBar.modified}<span class="gd-modified">{workBar.modified} modified</span>{/if}
+          {#if workBar.deleted}<span class="gd-deleted">−{workBar.deleted} deleted</span>{/if}
+        </span>
+        <span class="gd-workbar-go" aria-hidden="true">→</span>
+      </button>
+    {/if}
   {#if searchActive ? searchLoading && searchRows.length === 0 : loading}
     <p class="gd-state" role="status">{searchActive ? "Searching…" : "Loading history…"}</p>
   {:else if searchActive ? searchError : error}
@@ -463,27 +503,50 @@
 
 <style>
   .gd-history { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; background: var(--gd-canvas); }
-  .gd-history-bar { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border-bottom: 1px solid var(--gd-border); font-size: var(--gd-font-size-small); flex: 0 0 auto; }
-  .gd-scope { display: flex; align-items: center; gap: 12px; font-weight: 600; }
-  select { max-width: 200px; padding: 3px 6px; border: 1px solid var(--gd-border); border-radius: 4px; background: var(--gd-panel); color: var(--gd-text); font: inherit; }
+  .gd-history-bar { display: flex; align-items: center; gap: 8px; min-height: 28px; padding: 1px 12px; border-bottom: 1px solid var(--gd-border); font-size: var(--gd-font-size-small); flex: 0 0 auto; }
+  .gd-scope { display: flex; align-items: center; gap: 8px; }
+  .gd-scope label { color: var(--gd-text-secondary); white-space: nowrap; }
+  select { max-width: 220px; padding: 1px 4px; border: 1px solid var(--gd-border); border-radius: 4px; background: var(--gd-panel); color: var(--gd-text); font: inherit; }
   .gd-total { margin-left: auto; color: var(--gd-text-secondary); white-space: nowrap; }
   .gd-search-hint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--gd-text-secondary); }
   .gd-clear, .gd-show-graph, .gd-state button { background: var(--gd-panel); color: var(--gd-accent); border: 1px solid var(--gd-border); border-radius: 4px; padding: 4px 8px; cursor: pointer; font: inherit; }
   .gd-clear { margin-left: auto; }
   .gd-history-header, .gd-commit-row { display: grid; grid-template-columns: var(--history-columns); width: var(--history-width); }
   .gd-history-header { position: sticky; top: 0; z-index: 3; height: 28px; background: var(--gd-panel); border-bottom: 1px solid var(--gd-border); color: var(--gd-text-secondary); font-size: var(--gd-font-size-small); }
+  .gd-workbar {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--gd-space-3);
+    position: sticky;
+    top: 28px;
+    left: 0;
+    z-index: 2;
+    width: 100%;
+    min-height: 28px;
+    padding: 4px var(--gd-space-3);
+    color: var(--gd-text);
+    background: var(--gd-surface-raised);
+    border: 0;
+    border-bottom: 1px solid var(--gd-border);
+    cursor: pointer;
+    font-size: var(--gd-font-size-small);
+    text-align: left;
+  }
+  .gd-workbar:hover { background: var(--gd-surface-hover); }
+  .gd-workbar:focus-visible { outline: 2px solid var(--gd-focus); outline-offset: -2px; }
+  .gd-workbar-stats { display: flex; gap: var(--gd-space-2); color: var(--gd-text-secondary); }
+  .gd-workbar .gd-added { color: var(--gd-accent); }
+  .gd-workbar .gd-modified { color: var(--gd-warning); }
+  .gd-workbar .gd-deleted { color: var(--gd-danger); }
+  .gd-workbar-go { color: var(--gd-text-secondary); }
   .gd-column-head { position: relative; display: flex; align-items: center; min-width: 0; }
   .gd-column-head > span { padding-left: 12px; }
   .gd-graph-head { flex-direction: column; align-items: stretch; justify-content: space-between; }
   .gd-graph-head > span { line-height: 17px; }
-  .gd-lane-scroll { width: 100%; height: 14px; overflow-x: scroll; overflow-y: hidden; scrollbar-width: thin; }
-  .gd-lane-scroll::-webkit-scrollbar { height: 10px; }
+  .gd-lane-scroll { width: 100%; height: 14px; overflow-x: scroll; overflow-y: hidden; }
   .gd-lane-scroll:focus-visible { outline: 2px solid var(--gd-focus); outline-offset: -2px; }
-  .gd-viewport { flex: 1 1 0; overflow-x: scroll; overflow-y: auto; min-width: 0; min-height: 0; scrollbar-gutter: stable; scrollbar-color: var(--gd-text-secondary) var(--gd-panel); }
-  .gd-viewport::-webkit-scrollbar { width: 12px; height: 12px; }
-  .gd-viewport::-webkit-scrollbar-track { background: var(--gd-panel); }
-  .gd-viewport::-webkit-scrollbar-thumb { background: var(--gd-text-secondary); border: 3px solid var(--gd-panel); border-radius: 8px; }
-  .gd-viewport::-webkit-scrollbar-corner { background: var(--gd-panel); }
+  .gd-viewport { flex: 1 1 0; overflow-x: scroll; overflow-y: auto; min-width: 0; min-height: 0; scrollbar-gutter: stable; }
   .gd-list-row { position: relative; width: var(--history-width); }
   .gd-list-row.contexted .gd-commit-row { background: var(--gd-surface-hover); box-shadow: inset 3px 0 var(--gd-focus), inset 0 -1px color-mix(in srgb, var(--gd-border) 45%, transparent); }
   .gd-commit-row { align-items: center; height: 28px; padding: 0; color: var(--gd-text); background: transparent; border: 0; box-shadow: inset 0 -1px color-mix(in srgb, var(--gd-border) 45%, transparent); text-align: left; font: inherit; cursor: pointer; }
