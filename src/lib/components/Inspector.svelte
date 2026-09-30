@@ -9,6 +9,7 @@
     CommitDetails,
     ConflictFile,
     ConflictPreview,
+    ResolvedConflictFile,
     RefItem,
     DiffTarget
   } from "../ipc/types";
@@ -62,6 +63,9 @@
     /** T13 conflict inspector: live unmerged state, null until loaded. */
     mergeBanner: string | null;
     conflictFiles: ConflictFile[] | null;
+    conflictResolvedFiles: ResolvedConflictFile[];
+    conflictCurrentLabel: string;
+    conflictIncomingLabel: string;
     conflictFilesLoading: boolean;
     conflictFilesError: AppError | null;
     conflictSelected: string | null;
@@ -72,6 +76,7 @@
     conflictActionError: AppError | null;
     conflictNotice: string | null;
     mergeSubject: string;
+    mergeBody: string;
     reviewedStaged: boolean;
     canComplete: boolean;
     canAbort: boolean;
@@ -80,12 +85,15 @@
     acceptConfirm: { side: string; summary: string; token: string } | null;
     onSelectConflict: (pathId: string) => void;
     onReloadConflicts: () => void;
+    onSelectResolvedConflict: (displayPath: string) => void;
+    onMarkAllResolved: () => void;
     onAskAccept: (side: string) => void;
     onConfirmAccept: () => void;
     onCancelAccept: () => void;
     onMarkWorking: () => void;
     onMarkDeletion: () => void;
     onMergeSubject: (value: string) => void;
+    onMergeBody: (value: string) => void;
     onCompleteMerge: () => void;
     onAskAbort: () => void;
     onConfirmAbort: () => void;
@@ -134,6 +142,9 @@
     onRetryDetails,
     mergeBanner,
     conflictFiles,
+    conflictResolvedFiles,
+    conflictCurrentLabel,
+    conflictIncomingLabel,
     conflictFilesLoading,
     conflictFilesError,
     conflictSelected,
@@ -144,6 +155,7 @@
     conflictActionError,
     conflictNotice,
     mergeSubject,
+    mergeBody,
     reviewedStaged,
     canComplete,
     canAbort,
@@ -152,12 +164,15 @@
     acceptConfirm,
     onSelectConflict,
     onReloadConflicts,
+    onSelectResolvedConflict,
+    onMarkAllResolved,
     onAskAccept,
     onConfirmAccept,
     onCancelAccept,
     onMarkWorking,
     onMarkDeletion,
     onMergeSubject,
+    onMergeBody,
     onCompleteMerge,
     onAskAbort,
     onConfirmAbort,
@@ -183,6 +198,9 @@
     <ConflictPanel
       {mergeBanner}
       files={conflictFiles ?? []}
+      resolvedFiles={conflictResolvedFiles}
+      currentLabel={conflictCurrentLabel}
+      incomingLabel={conflictIncomingLabel}
       filesLoading={conflictFilesLoading}
       filesError={conflictFilesError}
       selectedPathId={conflictSelected}
@@ -191,8 +209,9 @@
       previewError={conflictPreviewError}
       busy={conflictBusy}
       actionError={conflictActionError}
-      notice={conflictNotice}
+      notice={""}
       {mergeSubject}
+      {mergeBody}
       {reviewedStaged}
       {canComplete}
       {canAbort}
@@ -202,12 +221,15 @@
       {trustBlocked}
       onSelectFile={onSelectConflict}
       onReload={onReloadConflicts}
+      onSelectResolved={onSelectResolvedConflict}
+      onMarkAll={onMarkAllResolved}
       {onAskAccept}
       {onConfirmAccept}
       {onCancelAccept}
       {onMarkWorking}
       {onMarkDeletion}
       {onMergeSubject}
+      {onMergeBody}
       onComplete={onCompleteMerge}
       {onAskAbort}
       {onConfirmAbort}

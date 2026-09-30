@@ -140,16 +140,17 @@
   {#if headDetached}<p class="gd-notice">Detached HEAD. Create a branch to keep your next commit reachable.</p>{/if}
 </div>
 <footer class="gd-commit-editor">
-  <div class="gd-editor-heading"><h3>{amendOid ? "Amend commit" : "Create commit"}</h3><span>Staged files only</span></div>
-  <label class="gd-amend-toggle" title={amendUnavailable ?? "Replace the latest commit with your staged changes and message"}>
-    <input type="checkbox" checked={amendOid !== null} disabled={disabled || amendLoading || (!amendOid && (!!amendUnavailable || !!conflicts.length))} onchange={e => {
-      const enabled = e.currentTarget.checked;
-      // The mode changes only after HEAD loads successfully.
-      e.currentTarget.checked = amendOid !== null;
-      onAmend(enabled);
-    }} />
-    Amend last commit
-  </label>
+  <div class="gd-editor-heading"><h3>{amendOid ? "Amend commit" : "Create commit"}</h3>
+    <label class="gd-amend-toggle" title={amendUnavailable ?? "Replace the latest commit with your staged changes and message"}>
+      <input type="checkbox" checked={amendOid !== null} disabled={disabled || amendLoading || (!amendOid && (!!amendUnavailable || !!conflicts.length))} onchange={e => {
+        const enabled = e.currentTarget.checked;
+        // The mode changes only after HEAD loads successfully.
+        e.currentTarget.checked = amendOid !== null;
+        onAmend(enabled);
+      }} />
+      Amend last commit
+    </label>
+  </div>
   {#if amendLoading}<p class="gd-commit-hint" role="status">Loading last commit…</p>
   {:else if amendUnavailable}<p class="gd-commit-hint">{amendUnavailable}</p>{/if}
   <label for={summaryId}>Summary</label>
@@ -195,9 +196,9 @@
   .gd-notice { border-color: var(--gd-warning); color: var(--gd-warning); }
   .gd-commit-editor { flex: 0 0 auto; padding: 10px 12px; border-top: 1px solid var(--gd-border); background: color-mix(in srgb, var(--gd-panel) 65%, var(--gd-canvas)); }
   .gd-editor-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
-  .gd-editor-heading>span, .gd-commit-hint { color: var(--gd-text-secondary); font-size: 10px; }
+  .gd-commit-hint { color: var(--gd-text-secondary); font-size: 10px; }
   label { display: block; color: var(--gd-text-secondary); font-size: 11px; margin-bottom: 6px; }
-  .gd-amend-toggle { display: flex; align-items: center; gap: 7px; margin-bottom: 10px; color: var(--gd-text); cursor: pointer; }
+  .gd-amend-toggle { display: flex; align-items: center; gap: 7px; margin: 0; color: var(--gd-text); cursor: pointer; }
   .gd-amend-toggle input { width: auto; margin: 0; accent-color: var(--gd-accent); }
   .gd-amend-notice { color: var(--gd-warning); font-size: 11px; line-height: 1.4; margin: 0 0 10px; }
   input, textarea { width: 100%; background: var(--gd-canvas); color: var(--gd-text); border: 1px solid var(--gd-border); border-radius: 4px; padding: 7px 8px; font: var(--gd-font-size-small)/1.4 var(--gd-font-ui); }

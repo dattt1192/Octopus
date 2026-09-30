@@ -192,7 +192,7 @@ fn new_operation(repo_id: &str, request_id: &str, kind: &str) -> OperationRecord
     }
 }
 
-fn network_error(stderr: &str) -> AppError {
+pub(crate) fn network_error(stderr: &str) -> AppError {
     match classify_network_stderr(stderr) {
         NetworkFault::Offline => AppError::new(
             ErrorCode::OFFLINE,
