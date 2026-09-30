@@ -37,6 +37,7 @@
   import type { mockAdapter as MockAdapter } from "../lib/ipc/mock";
   import type { WorkspaceState } from "../lib/repositories/tabs";
   import { autoStashMessage, needsStashOffer } from "../lib/repositories/tabs";
+  import { AutoFetchScheduler, DEFAULT_AUTO_FETCH_MINUTES } from "../lib/sync/auto-fetch";
   import { asSyncKind, syncFailureMessage, type SyncKind } from "../lib/sync/errors";
   import { BITBUCKET_TOKEN_URL, isBitbucketCloudHttps } from "../lib/sync/bitbucket";
   import { realAdapter } from "../lib/ipc/real";
@@ -233,6 +234,9 @@
   // through operation events with an operationGet poll fallback.
   let remoteStatus: RemoteStatus | null = $state(null);
   let syncJob: OperationRecord | null = $state(null);
+  let syncStarting = $state(false);
+  let syncRefreshing = $state(false);
+  let finishedSyncOperation: string | null = null;
   let syncError: string | null = $state(null);
   let syncErrorCode: string | null = $state(null);
   let syncRetryKind: SyncKind | null = $state(null);
@@ -530,6 +534,7 @@
   );
 
   const syncJobActive = $derived.by(() => {
+    if (syncStarting || syncRefreshing) return true;
     const job = syncJob;
     if (!job) return false;
     return job.state === "queued" || job.state === "running" || job.state === "cancelling";
@@ -550,51 +555,62 @@
   /** Refresh everything a finished job may have changed. */
   async function afterSyncJob(record: OperationRecord): Promise<void> {
     const repoId = record.repoId;
-    if (!session || (repoId !== null && session.repoId !== repoId)) return;
-    if (record.state === "succeeded") {
-      syncError = null;
-      syncErrorCode = null;
-      syncRetryKind = null;
-      try {
-        if (!demo) session = await realAdapter.repoSnapshot(session.repoId, true);
-      } catch {
-        // Keep the last snapshot; the listings below still refresh.
+    if (disposed || !session || (repoId !== null && session.repoId !== repoId) || finishedSyncOperation === record.operationId) return;
+    finishedSyncOperation = record.operationId;
+    if (record.kind === "fetch") autoFetch.finished(record.state === "failed");
+    syncRefreshing = true;
+    try {
+      if (record.state === "succeeded") {
+        syncError = null;
+        syncErrorCode = null;
+        syncRetryKind = null;
+        try {
+          if (!demo) session = await realAdapter.repoSnapshot(session.repoId, true);
+        } catch {
+          // Keep the last snapshot; the listings below still refresh.
+        }
+        await loadHistory(true);
+        await loadStatus();
+        await loadRemoteStatus();
+      } else if (record.state === "failed") {
+        syncErrorCode = record.error?.code ?? record.errorCode ?? "GIT_ERROR";
+        syncRetryKind = asSyncKind(record.kind);
+        syncError = syncFailureMessage(record.kind, syncErrorCode, record.error, remoteStatus?.url ?? null);
+        await loadRemoteStatus();
+      } else if (record.state === "cancelled") {
+        syncError = `${record.kind} was cancelled.`;
+        syncErrorCode = null;
+        syncRetryKind = null;
       }
-      await loadHistory(true);
-      await loadStatus();
-      await loadRemoteStatus();
-    } else if (record.state === "failed") {
-      syncErrorCode = record.error?.code ?? record.errorCode ?? "GIT_ERROR";
-      syncRetryKind = asSyncKind(record.kind);
-      syncError = syncFailureMessage(record.kind, syncErrorCode, record.error, remoteStatus?.url ?? null);
-      await loadRemoteStatus();
-    } else if (record.state === "cancelled") {
-      syncError = `${record.kind} was cancelled.`;
-      syncErrorCode = null;
-      syncRetryKind = null;
+      if (syncLogOpen) await loadOperationLog();
+    } finally {
+      syncRefreshing = false;
     }
-    if (syncLogOpen) await loadOperationLog();
   }
 
   /** Poll fallback: events are best-effort, the record is authoritative. */
   async function trackSyncJob(repoId: string, operationId: string): Promise<void> {
     stopSyncPoll();
     try {
-      syncJob = await syncAdapter().operationGet(operationId);
+      const record = await syncAdapter().operationGet(operationId);
+      if (disposed || session?.repoId !== repoId) return;
+      syncJob = record;
     } catch (e) {
       syncError = (e as AppError).message ?? "Could not read the operation.";
-      return;
     }
-    if (session === null || session.repoId !== repoId) return;
-    if (syncTerminal(syncJob.state)) {
+    if (disposed || session === null || session.repoId !== repoId) return;
+    if (syncJob && syncTerminal(syncJob.state)) {
       await afterSyncJob(syncJob);
       return;
     }
+    let polling = false;
     syncPoll = setInterval(() => {
+      if (polling || disposed) return;
+      polling = true;
       void (async () => {
         try {
           const record = await syncAdapter().operationGet(operationId);
-          if (session === null || session.repoId !== repoId) {
+          if (disposed || session === null || session.repoId !== repoId) {
             stopSyncPoll();
             return;
           }
@@ -605,13 +621,17 @@
           }
         } catch {
           // Keep the last known state; the next tick retries.
+        } finally {
+          polling = false;
         }
       })();
     }, 600);
   }
 
   async function startSyncJob(kind: "fetch" | "pull" | "push"): Promise<void> {
-    if (!session || syncJobActive) return;
+    if (disposed || !session || syncDisabled || syncJobActive) return;
+    syncStarting = true;
+    if (kind === "fetch") autoFetch.attempted();
     const current = session;
     syncError = null;
     syncErrorCode = null;
@@ -624,12 +644,16 @@
           : kind === "pull"
             ? await adapter.remotePull(current.repoId, current.version)
             : await adapter.remotePush(current.repoId, current.version, null, true);
+      if (disposed || session?.repoId !== current.repoId) return;
+      syncJob = { operationId: started.operationId, requestId: "", repoId: current.repoId, kind,
+        state: "queued", stage: "", progress: null, errorCode: null };
       await trackSyncJob(current.repoId, started.operationId);
     } catch (e) {
       if (session === null || session.repoId !== current.repoId) return;
       const error = e as AppError;
       syncErrorCode = error.code ?? "GIT_ERROR";
       syncRetryKind = kind;
+      if (kind === "fetch") autoFetch.finished(true);
       syncError = syncFailureMessage(kind, syncErrorCode, error, remoteStatus?.url ?? null);
       if (!demo) {
         try {
@@ -638,6 +662,8 @@
           // Keep the last snapshot; the error above is what matters.
         }
       }
+    } finally {
+      syncStarting = false;
     }
   }
 
@@ -787,8 +813,37 @@
   let showHelp = $state(false);
   let settings: SettingsV1 | null = $state(null);
   let settingsDraftScale = $state(1);
+  let settingsDraftAutoFetch = $state(DEFAULT_AUTO_FETCH_MINUTES);
+  let settingsLoading = $state(false);
   let settingsBusy = $state(false);
   let settingsError: AppError | null = $state(null);
+
+  const autoFetch = new AutoFetchScheduler(() => ({
+    minutes: settings?.autoFetchMinutes ?? 0,
+    active: active && !disposed,
+    online: navigator.onLine,
+    session,
+    remote: remoteStatus,
+    busy: busy || syncJobActive || indexBusy || discardBusy || commitBusy || amendLoading || branchBusy ||
+      historyActionBusy || mergeBusy || conflictBusy !== null || stashSaveBusy || stashBusyEntry !== null ||
+      stashSwitchBusy || !!pullRequest?.busy || bitbucketBusy || settingsLoading || settingsBusy ||
+      statusLoading || historyLoading || showSettings || showBranches || showMerge || showStash ||
+      historyAction !== null || discardConfirm !== null || branchForm !== null || stashSwitch !== null ||
+      pullRequest !== null || showBitbucketAuth || (!!syncError && syncRetryKind !== "fetch" &&
+        !(syncJob?.kind === "fetch" && syncJob.state === "cancelled"))
+  }), () => startSyncJob("fetch"));
+
+  function acceptSettings(next: SettingsV1): void {
+    if (disposed || (settings && next.version < settings.version)) return;
+    settings = next;
+    settingsDraftScale = next.fontScale;
+    settingsDraftAutoFetch = next.autoFetchMinutes;
+    applyFontScale(next.fontScale);
+  }
+
+  function settingsChanged(event: Event): void {
+    acceptSettings((event as CustomEvent<SettingsV1>).detail);
+  }
 
   const DRAFTS_KEY = "gitdock.drafts.v2";
   const WIDTHS_KEY = "gitdock.widths.v1";
@@ -816,32 +871,32 @@
 
   async function loadSettings(): Promise<void> {
     settingsError = null;
+    settingsLoading = true;
     try {
       const next = demo ? await mockAdapter.settingsGet() : await realAdapter.settingsGet();
-      settings = next;
-      settingsDraftScale = next.fontScale;
-      applyFontScale(next.fontScale);
+      acceptSettings(next);
     } catch (e) {
       settingsError = e as AppError;
+    } finally {
+      settingsLoading = false;
     }
   }
 
   async function saveSettings(): Promise<void> {
-    if (!settings || settingsBusy) return;
+    if (!settings || settingsBusy || settingsLoading) return;
     const current = settings;
     settingsBusy = true;
     settingsError = null;
     try {
       const next = demo
-        ? await mockAdapter.settingsUpdate(current.version, settingsDraftScale)
-        : await realAdapter.settingsUpdate(current.version, settingsDraftScale);
-      settings = next;
-      settingsDraftScale = next.fontScale;
-      applyFontScale(next.fontScale);
+        ? await mockAdapter.settingsUpdate(current.version, settingsDraftScale, settingsDraftAutoFetch)
+        : await realAdapter.settingsUpdate(current.version, settingsDraftScale, settingsDraftAutoFetch);
+      acceptSettings(next);
+      window.dispatchEvent(new CustomEvent<SettingsV1>("octopus:settings-changed", { detail: next }));
     } catch (e) {
-      settingsError = e as AppError;
-      // A concurrent writer wins: reload instead of sitting on stale state.
-      await loadSettings();
+      const error = e as AppError;
+      if (error.code === "STALE_STATE") await loadSettings();
+      settingsError = error;
     } finally {
       settingsBusy = false;
     }
@@ -2807,6 +2862,8 @@
   onMount(() => {
     void loadPreflight();
     void loadSettings();
+    window.addEventListener("octopus:settings-changed", settingsChanged);
+    autoFetch.start();
     restoreWidths();
     void Promise.all([loadHistory(true), loadStatus(), loadRemoteStatus(), loadIdentity()]);
     if (amendNeedsValidation) void refreshActivatedRepository(false);
@@ -2814,6 +2871,8 @@
   });
   onDestroy(() => {
     disposed = true;
+    autoFetch.stop();
+    window.removeEventListener("octopus:settings-changed", settingsChanged);
     persistDraft();
     clearTimeout(searchTimer);
     searchController.invalidate();
@@ -2887,7 +2946,7 @@
       onInit={onInitRepository}
       onClose={onCloseRepository}
       onBranches={openBranches}
-      onOpenSettings={() => (showSettings = true)}
+      onOpenSettings={() => { showSettings = true; void loadSettings(); }}
       onOpenHelp={() => (showHelp = true)}
       repoName={session.displayName}
     >
@@ -2895,6 +2954,7 @@
         <GitActions
           onBranches={() => openBranches()}
           syncDisabled={syncDisabled}
+          autoFetchMinutes={settings?.autoFetchMinutes ?? 0}
           {syncDisabledReason}
           jobActive={syncJobActive}
           activeJobKind={syncJobActive ? (syncJob?.kind ?? null) : null}
@@ -3301,6 +3361,10 @@
   {#if active && showSettings}
     <SettingsModal
       fontScale={settingsDraftScale}
+      autoFetchMinutes={settingsDraftAutoFetch}
+      loading={settingsLoading}
+      onAutoFetch={(value) => (settingsDraftAutoFetch = value)}
+      onRetry={() => void loadSettings()}
       version={settings?.version ?? null}
       busy={settingsBusy}
       error={settingsError}
@@ -3312,7 +3376,7 @@
       onClose={() => {
         showSettings = false;
         settingsError = null;
-        if (settings) settingsDraftScale = settings.fontScale;
+        if (settings) acceptSettings(settings);
       }}
     />
   {/if}

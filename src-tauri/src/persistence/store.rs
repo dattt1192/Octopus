@@ -24,6 +24,12 @@ const MAX_OPEN_WORKSPACES: usize = 20;
 pub struct SettingsV1 {
     pub version: u64,
     pub font_scale: f32,
+    #[serde(default = "default_auto_fetch_minutes")]
+    pub auto_fetch_minutes: u32,
+}
+
+fn default_auto_fetch_minutes() -> u32 {
+    5
 }
 
 impl Default for SettingsV1 {
@@ -31,6 +37,7 @@ impl Default for SettingsV1 {
         Self {
             version: 1,
             font_scale: 1.0,
+            auto_fetch_minutes: default_auto_fetch_minutes(),
         }
     }
 }
@@ -108,13 +115,21 @@ impl Store {
         &self.data.settings
     }
 
-    /// Apply a validated font scale, bumping the settings version.
-    /// Returns the new settings. Callers validate the range first.
-    pub fn set_font_scale(&mut self, font_scale: f32) -> SettingsV1 {
+    /// Persist validated preferences, retaining the old state if the write fails.
+    pub fn update_settings(
+        &mut self,
+        font_scale: f32,
+        auto_fetch_minutes: u32,
+    ) -> std::io::Result<SettingsV1> {
+        let previous = self.data.settings.clone();
         self.data.settings.font_scale = font_scale;
+        self.data.settings.auto_fetch_minutes = auto_fetch_minutes;
         self.data.settings.version = self.data.settings.version.saturating_add(1);
-        let _ = self.save();
-        self.data.settings.clone()
+        if let Err(error) = self.save() {
+            self.data.settings = previous;
+            return Err(error);
+        }
+        Ok(self.data.settings.clone())
     }
 
     pub fn recents(&self) -> &[RecentEntry] {
