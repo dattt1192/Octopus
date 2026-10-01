@@ -62,7 +62,6 @@
     filesLoading,
     filesError,
     selectedPathId,
-    previewLoading,
     previewError,
     busy,
     actionError,
@@ -271,9 +270,9 @@
   .gd-status-add { color: var(--gd-success); }
   .gd-status-delete { color: var(--gd-danger); }
   .gd-status-modify { fill: none; stroke: var(--gd-warning); stroke-width: 1.8; }
-  .gd-error, .gd-notice, .gd-inline-state { margin: 0 0 10px; padding: 8px 10px; border-left: 2px solid var(--gd-danger); background: var(--gd-canvas); color: var(--gd-danger); font-size: 11px; line-height: 1.45; }
+  .gd-error, .gd-notice { margin: 0 0 10px; padding: 8px 10px; border-left: 2px solid var(--gd-danger); background: var(--gd-canvas); color: var(--gd-danger); font-size: 11px; line-height: 1.45; }
   .gd-error p { margin: 0; }
-  .gd-notice, .gd-inline-state { border-color: var(--gd-warning); color: var(--gd-warning); }
+  .gd-notice { border-color: var(--gd-warning); color: var(--gd-warning); }
   .gd-text-action { border: 0; padding: 3px 0 0; background: transparent; color: var(--gd-accent); cursor: pointer; font-size: 11px; }
   .gd-empty { margin: 0; padding: 10px 8px; color: var(--gd-text-secondary); font-size: 11px; line-height: 1.45; }
   .gd-commit-editor { flex: 0 0 auto; padding: 10px 12px; border-top: 1px solid var(--gd-border); background: color-mix(in srgb, var(--gd-panel) 65%, var(--gd-canvas)); }

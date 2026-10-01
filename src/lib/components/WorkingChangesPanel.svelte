@@ -174,7 +174,6 @@
   .gd-work-summary { display: flex; min-width: 0; flex-direction: column; gap: 2px; margin: 0; color: var(--gd-text-secondary); font-size: 10px; }
   .gd-work-summary strong { color: var(--gd-text); font-size: 12px; font-weight: 620; }
   .gd-work-summary span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .gd-work-summary em { color: var(--gd-accent); font-style: normal; }
   .gd-group-heading { display: flex; align-items: center; justify-content: space-between; padding: 0 4px 8px; border-bottom: 1px solid var(--gd-border); margin-bottom: 4px; }
   .gd-group-toggle { display: flex; align-items: center; gap: 6px; margin: 0; padding: 2px 4px; background: transparent; border: 0; border-radius: 4px; cursor: pointer; color: var(--gd-text); font-size: 12px; font-weight: 600; }
   .gd-group-toggle:focus-visible { outline: 2px solid var(--gd-focus); outline-offset: 1px; }
@@ -189,8 +188,6 @@
   button:disabled { opacity: .4; cursor: not-allowed; }
   .gd-text-action:not(:disabled):hover { text-decoration: underline; }
   .gd-empty { padding: 8px; color: var(--gd-text-secondary); font-size: 11px; line-height: 1.6; }
-  .gd-clean { padding: 16px 6px; color: var(--gd-accent); }
-  .gd-clean p { color: var(--gd-text-secondary); line-height: 1.6; font-size: 12px; }
   .gd-error, .gd-notice { padding: 10px; background: var(--gd-canvas); border-left: 2px solid var(--gd-danger); color: var(--gd-danger); font-size: 12px; line-height: 1.5; }
   .gd-error p { margin: 0; }
   .gd-notice { border-color: var(--gd-warning); color: var(--gd-warning); }
@@ -200,7 +197,6 @@
   label { display: block; color: var(--gd-text-secondary); font-size: 11px; margin-bottom: 6px; }
   .gd-amend-toggle { display: flex; align-items: center; gap: 7px; margin: 0; color: var(--gd-text); cursor: pointer; }
   .gd-amend-toggle input { width: auto; margin: 0; accent-color: var(--gd-accent); }
-  .gd-amend-notice { color: var(--gd-warning); font-size: 11px; line-height: 1.4; margin: 0 0 10px; }
   input, textarea { width: 100%; background: var(--gd-canvas); color: var(--gd-text); border: 1px solid var(--gd-border); border-radius: 4px; padding: 7px 8px; font: var(--gd-font-size-small)/1.4 var(--gd-font-ui); }
   textarea { resize: vertical; min-height: 64px; max-height: 140px; margin-top: 8px; }
   details { margin-top: 10px; font-size: 11px; color: var(--gd-text-secondary); }

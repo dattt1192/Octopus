@@ -153,7 +153,6 @@
     conflictPreviewError,
     conflictBusy,
     conflictActionError,
-    conflictNotice,
     mergeSubject,
     mergeBody,
     reviewedStaged,
@@ -248,31 +247,5 @@
     border-left: 1px solid var(--gd-border);
     min-height: 0;
     min-width: 0;
-  }
-  .gd-inspector-tabs {
-    display: flex;
-    gap: 12px;
-    padding: 0 16px;
-    border-bottom: 1px solid var(--gd-border);
-    flex: 0 0 auto;
-  }
-  .gd-inspector-tabs button {
-    flex: 1;
-    padding: 13px 0;
-    color: var(--gd-text-secondary);
-    background: transparent;
-    border: 1px solid transparent;
-    border-radius: 0;
-    cursor: pointer;
-    font-size: var(--gd-font-size-small);
-  }
-  .gd-inspector-tabs button.active {
-    color: var(--gd-text);
-    background: transparent;
-    border-bottom-color: var(--gd-accent);
-    color: var(--gd-accent);
-  }
-  .gd-inspector-tabs button:focus-visible {
-    outline: 2px solid var(--gd-focus);
   }
 </style>

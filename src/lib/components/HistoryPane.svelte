@@ -660,9 +660,7 @@
   .gd-scope label { color: var(--gd-text-secondary); white-space: nowrap; }
   select { max-width: 220px; padding: 1px 4px; border: 1px solid var(--gd-border); border-radius: 4px; background: var(--gd-panel); color: var(--gd-text); font: inherit; }
   .gd-total { margin-left: auto; color: var(--gd-text-secondary); white-space: nowrap; }
-  .gd-search-hint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--gd-text-secondary); }
-  .gd-clear, .gd-show-graph, .gd-state button { background: var(--gd-panel); color: var(--gd-accent); border: 1px solid var(--gd-border); border-radius: 4px; padding: 4px 8px; cursor: pointer; font: inherit; }
-  .gd-clear { margin-left: auto; }
+  .gd-show-graph, .gd-state button { background: var(--gd-panel); color: var(--gd-accent); border: 1px solid var(--gd-border); border-radius: 4px; padding: 4px 8px; cursor: pointer; font: inherit; }
   .gd-history-header, .gd-commit-row { display: grid; grid-template-columns: var(--history-columns); width: var(--history-width); }
   .gd-history-header { position: sticky; top: 0; z-index: 3; height: 28px; grid-template-rows: minmax(0, 1fr); background: var(--gd-panel); border-bottom: 1px solid var(--gd-border); color: var(--gd-text-secondary); font-size: var(--gd-font-size-small); }
   .gd-workbar {
