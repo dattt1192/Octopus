@@ -22,7 +22,7 @@
   import BranchModal from "../lib/components/BranchModal.svelte";
   import CommitActionModal from "../lib/components/CommitActionModal.svelte";
   import StashSwitchModal from "../lib/components/StashSwitchModal.svelte";
-  import { COMMIT_ACTION_FORMS } from "../lib/history/commit-action-forms";
+  import { COMMIT_ACTION_FORMS, historyActionToast } from "../lib/history/commit-action-forms";
   import type { CommitActionId } from "../lib/history/commit-menu";
   import type { BranchFormOverride } from "../lib/history/commit-action-forms";
   import { defaultBranchTab, directMergeSubject, pullRequestTargetName, resolveCheckoutTarget, shouldAutoCompleteMerge, shouldConfirmResetBeforeCheckout, shouldPullAfterCheckout, type BranchMenuAction } from "../lib/refs/branch-menu";
@@ -37,7 +37,8 @@
   import type { mockAdapter as MockAdapter } from "../lib/ipc/mock";
   import type { WorkspaceState } from "../lib/repositories/tabs";
   import { autoStashMessage, needsStashOffer } from "../lib/repositories/tabs";
-  import { asSyncKind, shouldOfferPushRecovery, syncFailureMessage, type SyncKind } from "../lib/sync/errors";
+  import { asSyncKind, shouldOfferPushRecovery, syncCancelMessage, syncDoneMessage, syncFailureMessage, syncStartMessage, type SyncKind } from "../lib/sync/errors";
+  import { pushToast } from "../lib/toast";
   import { BITBUCKET_TOKEN_URL, isBitbucketCloudHttps } from "../lib/sync/bitbucket";
   import { realAdapter } from "../lib/ipc/real";
   import type {
@@ -259,6 +260,7 @@
   // through operation events with an operationGet poll fallback.
   let remoteStatus: RemoteStatus | null = $state(null);
   let syncJob: OperationRecord | null = $state(null);
+  let syncForce = $state(false);
   let syncError: string | null = $state(null);
   let syncErrorCode: string | null = $state(null);
   let syncRetryKind: SyncKind | null = $state(null);
@@ -581,6 +583,7 @@
       syncError = null;
       syncErrorCode = null;
       syncRetryKind = null;
+      pushToast("success", syncDoneMessage(record.kind, syncForce));
       // A manual success retires a stale offer; bar-driven jobs manage it.
       if (!pushBusy) {
         pushOffer = null;
@@ -616,6 +619,7 @@
       }
       await loadRemoteStatus();
     } else if (record.state === "cancelled") {
+      pushToast("info", syncCancelMessage(record.kind));
       syncError = `${record.kind} was cancelled.`;
       syncErrorCode = null;
       syncRetryKind = null;
@@ -668,6 +672,8 @@
       pushOffer = null;
       pushError = null;
     }
+    syncForce = force;
+    pushToast("info", syncStartMessage(kind, force));
     try {
       const adapter = syncAdapter();
       const started =
@@ -1202,6 +1208,7 @@
       );
       if (pullRequest !== draft) return;
       draft.result = result;
+      pushToast("success", `Pull request ${result.reference} created`);
     } catch (e) {
       if (pullRequest !== draft) return;
       draft.error = e as AppError;
@@ -1425,6 +1432,7 @@
         conflictNotice = `Resolved and staged ${doc.displayPath}.`;
         await loadStatus();
         await loadConflicts(false, false);
+        if (!conflictFiles?.length) pushToast("success", "All conflicts resolved");
       } else {
         mergeNotice = `Resolved ${result.resolvedBlocks} block(s), ${result.remainingBlocks} remaining.`;
         const refreshed = conflictFiles?.find((file) => file.displayPath === doc.displayPath);
@@ -1532,6 +1540,7 @@
       closeMerge(false);
       await loadStatus();
       await loadConflicts();
+      if (!conflictFiles?.length) pushToast("success", "All conflicts resolved");
     } catch (e) {
       if (session === null || session.repoId !== current.repoId) return;
       conflictActionError = e as AppError;
@@ -1561,6 +1570,7 @@
       mergeDraftCache.clear();
       closeMerge(false);
       conflictNotice = "All current conflict results were staged. Review the resolved files, then commit the merge.";
+      pushToast("success", "All conflicts resolved");
       await loadStatus();
       await loadConflicts(false, false);
     } catch (error) {
@@ -1614,6 +1624,13 @@
       reviewedStaged = false;
       changeInspector("working");
       conflictNotice = null;
+      {
+        const sourceLabel = refs.find((r) => r.refId === mergeSource)?.label ?? mergeSource;
+        pushToast(
+          "success",
+          mergeSource !== "" && mergeTargetLabel !== "" ? `Merged ${sourceLabel} into ${mergeTargetLabel}` : "Merge completed"
+        );
+      }
       await loadHistory(true);
       await loadStatus();
       await loadRemoteStatus();
@@ -1671,6 +1688,7 @@
       mergeDraftCache.clear();
       closeMerge(false);
       changeInspector("working");
+      pushToast("info", "Merge aborted");
       await loadStatus();
       await loadConflicts(false);
     } catch (e) {
@@ -1706,6 +1724,7 @@
       stashNotice = result.noChange
         ? "Nothing to stash — the worktree already matches HEAD."
         : `Stashed${result.oid ? ` (${result.oid.slice(0, 8)})` : ""}.`;
+      pushToast(result.noChange ? "info" : "success", stashNotice);
       stashMessage = "";
       await loadStatus();
       await loadStashList();
@@ -1754,6 +1773,7 @@
             ? `Popped ${entry.stashId}.`
             : `Applied ${entry.stashId} (entry kept).`;
       }
+      pushToast(result.conflicted || result.dropError ? "info" : "success", stashNotice);
       await loadStatus();
       await loadStashList();
     } catch (e) {
@@ -1790,6 +1810,7 @@
     if (latest === null) {
       stashError = null;
       stashNotice = "No stashed changes to pop.";
+      pushToast("info", stashNotice);
       return;
     }
     await applyStash(latest, "pop");
@@ -2057,6 +2078,12 @@
         ? await statusAdapter().worktreeDiscardFile(current.repoId, current.version, pending.pathId, pending.token)
         : await statusAdapter().diffHunkDiscard(current.repoId, current.version, pending.pathId, pending.hunkId ?? "", pending.token);
       discardConfirm = null;
+      pushToast(
+        "success",
+        pending.kind === "hunk"
+          ? `Discarded hunk${displayPath ? ` in ${displayPath}` : ""}`
+          : `Discarded changes${displayPath ? ` in ${displayPath}` : ""}`
+      );
       if (pending.kind === "hunk" && displayPath) await refreshOpenWorktreeDiff(displayPath);
       else {
         clearDiff();
@@ -2102,6 +2129,7 @@
         done += 1;
       }
       discardConfirm = null;
+      pushToast("success", done === 1 ? "Discarded 1 file" : `Discarded ${done} files`);
       clearDiff();
       await loadStatus();
     } catch (error) {
@@ -2200,6 +2228,11 @@
       );
       if (session === null || session.repoId !== current.repoId) return;
       session = result.snapshot;
+      if (amendOid) pushToast("success", `Amended ${result.oid.slice(0, 7)}`);
+      else {
+        const files = current.stagedCount ?? 0;
+        pushToast("success", files === 1 ? "Committed 1 file" : `Committed ${files} files`);
+      }
       shell.commitMessage = newCommitDraft?.subject ?? "";
       commitBody = newCommitDraft?.body ?? "";
       amendOid = null;
@@ -2540,6 +2573,10 @@
       }
       if (session === null || session.repoId !== current.repoId) return;
       session = snapshot;
+      if (form.kind === "rename") pushToast("success", `Renamed ${form.ref.label} to ${(values.name ?? "").trim()}`);
+      else if (form.kind === "upstream") pushToast("success", `Set upstream for ${form.ref.label}`);
+      else if (form.kind === "move") pushToast("success", `Moved ${form.ref.label} to ${form.targetOid?.slice(0, 7) ?? ""}`);
+      else pushToast("success", `Pushed ${form.ref.label}`);
       closeBranchForm();
       clearDiff();
       await reloadAfterMutation();
@@ -2638,6 +2675,7 @@
       }
       if (session === null || session.repoId !== current.repoId) return;
       session = snapshot;
+      pushToast("success", historyActionToast(action, row.oid, values, plan.length));
       closeHistoryAction();
       clearDiff();
       await reloadAfterMutation();
@@ -2677,10 +2715,14 @@
       );
       if (session === null || session.repoId !== current.repoId) return;
       session = result.snapshot;
+      const createdName = newBranchName;
       if (result.switched) {
         newBranchName = "";
+        pushToast("success", `Created and switched to ${createdName}`);
       } else if (result.switchError) {
         branchError = `Branch created, but switch failed (${result.switchError.code}): ${result.switchError.message}`;
+      } else {
+        pushToast("success", `Created branch ${createdName}`);
       }
       await reloadAfterMutation();
     } catch (e) {
@@ -2757,6 +2799,7 @@
       stashSwitchDone = stash.noChange
         ? `Switched to ${target.label}. Nothing needed stashing.`
         : `Switched to ${target.label}. Changes stashed — restore them from Stashes when ready.`;
+      pushToast("success", stash.noChange ? `Switched to ${target.label}` : `Stashed and switched to ${target.label}`);
       clearDiff();
       await reloadAfterMutation();
       if (target.kind === "branch" && target.pullAfter) await startSyncJob("pull");
@@ -2815,6 +2858,11 @@
       session = await statusAdapter().branchSwitch(current.repoId, current.version, refId, trackAs);
       if (session === null || session.repoId !== current.repoId) return false;
       await reloadAfterMutation();
+      // The reset flow toasts the reset itself; a plain switch toasts here.
+      if (resetAfter === null) {
+        const label = refs.find((r) => r.refId === refId)?.label ?? refId;
+        pushToast("success", trackAs ? `Switched to ${trackAs}` : `Switched to ${label}`);
+      }
       return true;
     } catch (e) {
       if (session === null || session.repoId !== current.repoId) return false;
@@ -2856,6 +2904,8 @@
       if (session === null || session.repoId !== current.repoId) return false;
       clearDiff();
       await reloadAfterMutation();
+      const head = session?.head;
+      pushToast("success", `Reset ${head?.kind === "branch" ? head.name : "branch"} to ${oid.slice(0, 7)}`);
       return true;
     } catch (e) {
       if (session === null || session.repoId !== current.repoId) return false;
@@ -2949,6 +2999,8 @@
         scopeValue = "all";
       }
       if (selectedRefId === target.refId) selectedRefId = null;
+      const deletedLabel = refs.find((r) => r.refId === target.refId)?.label ?? target.refId;
+      pushToast("success", `Deleted branch ${deletedLabel}`);
       await reloadAfterMutation();
     } catch (e) {
       if (session === null || session.repoId !== current.repoId) return;

@@ -6,6 +6,8 @@
   import Welcome from "../lib/components/Welcome.svelte";
   import InitModal from "../lib/components/InitModal.svelte";
   import CloneModal from "../lib/components/CloneModal.svelte";
+  import ToastCenter from "../lib/components/ToastCenter.svelte";
+  import { pushToast } from "../lib/toast";
   import { isNative, newRequestId, normalizeTransportError } from "../lib/ipc/client";
   import { mockAdapter, createMockAdapter } from "../lib/ipc/mock";
   import { realAdapter } from "../lib/ipc/real";
@@ -200,6 +202,7 @@
       const snapshot = demo ? await adapter.repoInit(initFolder, initBranch.trim()) : await realAdapter.repoInit(initFolder, initBranch.trim());
       attach(snapshot, adapter);
       showInit = false;
+      pushToast("success", `Initialized repository in ${initFolder}`);
       await loadRecents();
     } catch (e) { error = appError(e); }
     finally { opening = false; }
@@ -230,6 +233,7 @@
       const snapshot = demo ? await adapter.repoClone(cloneUrl.trim(), cloneFolder) : await realAdapter.repoClone(cloneUrl.trim(), cloneFolder);
       attach(snapshot, adapter);
       showClone = false;
+      pushToast("success", `Cloned ${cloneUrl.trim()} to ${cloneFolder}`);
       await loadRecents();
     } catch (e) { error = appError(e); }
     finally { opening = false; }
@@ -279,6 +283,7 @@
     onOpen={path=>void openPaths([path])} onBrowse={()=>void browse()} onInit={()=>void startInit()} onClone={startClone} onRemoveRecent={id=>void removeRecent(id)} onClose={closePicker} />{/if}
   {#if showInit}<InitModal folder={initFolder} branch={initBranch} busy={opening} {error} onBranch={value=>(initBranch=value)} onConfirm={()=>void confirmInit()} onCancel={()=>(showInit=false)} />{/if}
   {#if showClone}<CloneModal sourceUrl={cloneUrl} folder={cloneFolder} busy={opening} {error} onUrl={value=>(cloneUrl=value)} onBrowseFolder={()=>void browseCloneFolder()} onConfirm={()=>void confirmClone()} onCancel={()=>(showClone=false)} />{/if}
+  <ToastCenter />
 </div>
 
 <style>
