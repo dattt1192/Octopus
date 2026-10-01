@@ -170,7 +170,7 @@
     }));
   }
 
-  const laneColors = ["#66d9b2", "#66cde0", "#90b6ff", "#c39bf3", "#f1c66d", "#f199b8"];
+  const laneColors = ["var(--gd-lane-1)", "var(--gd-lane-2)", "var(--gd-lane-3)", "var(--gd-lane-4)", "var(--gd-lane-5)", "var(--gd-lane-6)"];
 
   function laneX(lane: number): number {
     return 8 + lane * laneWidth + laneWidth / 2;
@@ -178,6 +178,16 @@
 
   function color(lane: number): string {
     return laneColors[lane % laneColors.length];
+  }
+
+  function edgePath(fromLane: number, toLane: number): string {
+    const from = laneX(fromLane);
+    const to = laneX(toLane);
+    const center = rowHeight / 2;
+    if (from === to) return `M ${from} ${center} V ${rowHeight}`;
+    const direction = Math.sign(to - from);
+    const radius = Math.min(6, Math.abs(to - from) / 2, rowHeight / 4);
+    return `M ${from} ${center} H ${to - direction * radius} Q ${to} ${center}, ${to} ${center + radius} V ${rowHeight}`;
   }
 
   function onGraphScrollKeyDown(event: KeyboardEvent): void {
@@ -490,20 +500,23 @@
         {@const badges = badgesFor(row)}
         {@const committedAt = formatDateTime(row.committedAt)}
         {@const primary = primaryBadge(badges)}
+        {@const nodeRadius = row.parents.length > 1 ? 5 : 4}
+        {@const nodeX = laneX(laidRow?.lane ?? 0) - graphScrollLeft}
+        {@const showBranchLink = primary && laidRow && nodeX >= nodeRadius && nodeX <= graphWidth - nodeRadius}
         <div class="gd-list-row" class:contexted={rowMenu?.row.oid === row.oid} role="listitem"
           aria-setsize={activeRows().length} aria-posinset={window.start + i + 1}
           oncontextmenu={(event) => openRowMenu(event, row)} onkeydown={(event) => rowMenuKey(event, row)}>
           <button type="button" class="gd-commit-row" class:selected={selectedOid === row.oid} class:focused={focusOid === row.oid && selectedOid !== row.oid}
+            style:--commit-color={color(laidRow?.lane ?? 0)}
             aria-current={selectedOid === row.oid ? "true" : undefined}
             onclick={() => { focusOid = row.oid; onSelect(row.oid); }}
             aria-label={`${row.subject}, ${row.authorName}, ${row.parents.length} parent${row.parents.length === 1 ? "" : "s"}`}>
             {#if !searchActive}
               <span class="gd-branches">
                 {#if primary}
+                  <span class="gd-ref-labels">
                   <span
                     class="gd-ref-badge"
-                    class:remote={primary.kind === "remote"}
-                    class:tag={primary.kind === "tag"}
                     class:current={primary.current}
                     tabindex="0"
                     role="button"
@@ -524,8 +537,12 @@
                   >
                     <span class="gd-ref-source"><RefKindIcon kind={primary.kind} /></span><span class="gd-ref-name">{primary.name}</span>
                   </span>
+                  {#if badges.length > 1}<span class="gd-ref-extra">+{badges.length - 1}</span>{/if}
+                  </span>
+                  <svg class="gd-branch-link" class:visible={showBranchLink} height={rowHeight} aria-hidden="true">
+                    <rect y={rowHeight / 2} width="100%" height="1" fill="var(--commit-color)" opacity="0.5" shape-rendering="crispEdges" />
+                  </svg>
                 {/if}
-                {#if badges.length > 1}<span class="gd-ref-extra">+{badges.length - 1}</span>{/if}
               </span>
             <span class="gd-graph-clip">
             <svg
@@ -534,38 +551,45 @@
               height={rowHeight}
               aria-hidden="true"
             >
-              {#each laidRow?.rails ?? [] as rail (rail)}
-                <line
-                  x1={laneX(rail)}
-                  y1="0"
-                  x2={laneX(rail)}
-                  y2={rowHeight}
-                  stroke={color(rail)}
-                  stroke-width="2"
-                  stroke-opacity="0.9"
-                  stroke-linecap="round"
-                />
-              {/each}
-              {#if laidRow?.incoming}
-                <line x1={laneX(laidRow.lane)} y1="0" x2={laneX(laidRow.lane)} y2={rowHeight / 2}
-                  stroke={color(laidRow.lane)} stroke-width="2" />
-              {/if}
-              {#each laidRow?.edges ?? [] as edge, edgeIndex (edge.parentOid)}
-                <path
-                  d={`M ${laneX(edge.fromLane)} ${rowHeight / 2} C ${laneX(edge.fromLane)} ${rowHeight * 0.8}, ${laneX(edge.toLane)} ${rowHeight * 0.8}, ${laneX(edge.toLane)} ${rowHeight}`}
-                  fill="none"
-                  stroke={color(edgeIndex === 0 ? edge.fromLane : edge.toLane)}
-                  stroke-width="2"
-                  stroke-opacity="0.9"
-                  stroke-linecap="round"
-                />
-              {/each}
+              <g class="gd-graph-links">
+                {#if showBranchLink}
+                  <rect class="gd-graph-branch-link" x={graphScrollLeft} y={rowHeight / 2}
+                    width={nodeX - nodeRadius} height="1" fill="var(--commit-color)" opacity="0.5" shape-rendering="crispEdges" />
+                {/if}
+                {#each laidRow?.rails ?? [] as rail (rail)}
+                  <line
+                    x1={laneX(rail)}
+                    y1="0"
+                    x2={laneX(rail)}
+                    y2={rowHeight}
+                    stroke={color(rail)}
+                    stroke-width="2"
+                    stroke-opacity="0.9"
+                    stroke-linecap="round"
+                  />
+                {/each}
+                {#if laidRow?.incoming}
+                  <line x1={laneX(laidRow.lane)} y1="0" x2={laneX(laidRow.lane)} y2={rowHeight / 2}
+                    stroke={color(laidRow.lane)} stroke-width="2" />
+                {/if}
+                {#each laidRow?.edges ?? [] as edge, edgeIndex (edge.parentOid)}
+                  <path
+                    d={edgePath(edge.fromLane, edge.toLane)}
+                    fill="none"
+                    stroke={color(edgeIndex === 0 ? edge.fromLane : edge.toLane)}
+                    stroke-width="2"
+                    stroke-opacity="0.9"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                {/each}
+              </g>
               <circle
                 cx={laneX(laidRow?.lane ?? 0)}
                 cy={rowHeight / 2}
-                r={row.parents.length > 1 ? 5 : 4}
-                fill={row.parents.length > 1 ? color(laidRow?.lane ?? 0) : "var(--gd-canvas)"}
-                stroke={color(laidRow?.lane ?? 0)}
+                r={nodeRadius}
+                fill={row.parents.length > 1 ? "var(--commit-color)" : "var(--gd-canvas)"}
+                stroke="var(--commit-color)"
                 stroke-width="2.5"
               />
             </svg>
@@ -679,15 +703,16 @@
   .gd-commit-row:hover { background: var(--gd-surface-hover); }
   .gd-commit-row.selected { background: var(--gd-surface-selected); }
   .gd-commit-row.focused, button:focus-visible, .gd-viewport:focus-visible, select:focus-visible { outline: 2px solid var(--gd-focus); outline-offset: -2px; }
-  .gd-branches { display: flex; flex-direction: row; align-items: center; gap: 4px; height: 28px; min-width: 0; padding: 1px 8px; }
-  .gd-ref-badge { display: inline-flex; align-items: center; gap: 4px; flex: 0 1 auto; min-width: 0; max-width: 100%; border: 1px solid var(--gd-accent); border-radius: var(--gd-radius-control); background: transparent; color: var(--gd-accent); font-size: 11px; line-height: 1; padding: 3px 6px; white-space: nowrap; }
-  .gd-ref-badge.remote { border-color: var(--gd-lane-2); color: var(--gd-lane-2); }
-  .gd-ref-badge.tag { border-color: var(--gd-warning); color: var(--gd-warning); }
-  .gd-ref-badge.current { flex-shrink: 0; background: var(--gd-accent); border-color: var(--gd-accent); color: var(--gd-on-accent); }
+  .gd-branches { display: flex; align-items: center; height: 28px; min-width: 0; overflow: hidden; padding: 1px 0 1px 8px; }
+  .gd-ref-labels { display: inline-flex; align-items: center; gap: 4px; flex: 0 1 auto; min-width: 0; }
+  .gd-branch-link { display: block; flex: 1 0 8px; width: 8px; height: 28px; visibility: hidden; pointer-events: none; }
+  .gd-branch-link.visible { visibility: visible; }
+  .gd-ref-badge { display: inline-flex; align-items: center; gap: 4px; flex: 0 1 auto; min-width: 0; max-width: 100%; border: 1px solid var(--commit-color); border-radius: var(--gd-radius-control); background: transparent; color: var(--commit-color); font-size: 11px; line-height: 1; padding: 3px 6px; white-space: nowrap; }
+  .gd-ref-badge.current { background: var(--commit-color); color: var(--gd-on-accent); }
   .gd-ref-source { display: inline-flex; }
   .gd-ref-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
   .gd-ref-badge:focus-visible { outline: 2px solid var(--gd-focus); outline-offset: 1px; }
-  .gd-ref-extra { border: 1px solid var(--gd-border); border-radius: var(--gd-radius-control); color: var(--gd-text-secondary); font-size: 10px; line-height: 1; padding: 3px 6px; white-space: nowrap; cursor: default; }
+  .gd-ref-extra { flex: 0 0 auto; border: 1px solid var(--commit-color); border-radius: var(--gd-radius-control); color: var(--commit-color); font-size: 10px; line-height: 1; padding: 3px 6px; white-space: nowrap; cursor: default; }
   .gd-branch-tip { position: fixed; z-index: 60; display: flex; flex-direction: column; align-items: stretch; gap: 2px; min-width: 160px; max-width: 280px; max-height: 200px; overflow-y: auto; background: var(--gd-surface-raised); border: 1px solid var(--gd-border); border-radius: var(--gd-radius-control); padding: 4px; }
   .gd-branch-tip.above { transform: translateY(-100%); }
   .gd-tip-branch { display: flex; align-items: center; gap: 6px; width: 100%; background: transparent; border: 0; border-radius: var(--gd-radius-control); color: var(--gd-accent); font: inherit; font-size: 11px; padding: 4px 6px; cursor: pointer; text-align: left; }
