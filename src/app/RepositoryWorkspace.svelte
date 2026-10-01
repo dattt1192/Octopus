@@ -111,6 +111,13 @@
   let scopeValue = $state("all");
   /** Sidebar row highlight. Selecting a ref never narrows the graph. */
   let selectedRefId: string | null = $state(null);
+  /** Preserve the requested remote ref when checkout resolves to its local twin. */
+  let graphCheckout: { refId: string; headRefId: string } | null = $state(null);
+  const preferredGraphRefId = $derived.by(() => {
+    const head = session?.head;
+    return graphCheckout !== null && head?.kind === "branch" && head.refId === graphCheckout.headRefId
+      ? graphCheckout.refId : null;
+  });
   let refs: RefItem[] = $state([]);
   const searchController = new SearchController();
   let searchTimer: ReturnType<typeof setTimeout> | undefined = undefined;
@@ -215,6 +222,7 @@
     twinRefId: string;
     twinLabel: string;
     remoteLabel: string;
+    remoteRefId: string;
     remoteOid: string;
     ahead: number;
     behind: number;
@@ -237,7 +245,7 @@
 
   // Stash-and-switch offer when the worktree is dirty.
   type StashSwitchTarget =
-    | { kind: "branch"; refId: string; label: string; trackName: string | null; pullAfter: boolean; resetAfter: string | null }
+    | { kind: "branch"; refId: string; requestedRefId: string; label: string; trackName: string | null; pullAfter: boolean; resetAfter: string | null }
     | { kind: "checkout"; oid: string; label: string };
   let stashSwitch: StashSwitchTarget | null = $state(null);
   let stashSwitchIncludeUntracked = $state(true);
@@ -2427,7 +2435,7 @@
               if (session === null || session.repoId !== current.repoId) return;
               if (shouldConfirmResetBeforeCheckout(ref, session.trust === "trusted", true, counts.ahead)) {
                 resetOffer = {
-                  twinRefId: twin.refId, twinLabel: twin.label, remoteLabel: ref.label,
+                  twinRefId: twin.refId, twinLabel: twin.label, remoteLabel: ref.label, remoteRefId: ref.refId,
                   remoteOid: ref.oid, ahead: counts.ahead, behind: counts.behind, compareFailed: false
                 };
                 resetError = null;
@@ -2436,7 +2444,7 @@
             } catch (e) {
               if (session === null || session.repoId !== current.repoId) return;
               resetOffer = {
-                twinRefId: twin.refId, twinLabel: twin.label, remoteLabel: ref.label,
+                twinRefId: twin.refId, twinLabel: twin.label, remoteLabel: ref.label, remoteRefId: ref.refId,
                 remoteOid: ref.oid, ahead: 0, behind: 0, compareFailed: true
               };
               resetError = e as AppError;
@@ -2449,7 +2457,7 @@
             }
           }
         }
-        const switched = await switchBranch(target.refId, target.trackAs, pullAfter);
+        const switched = await switchBranch(target.refId, target.trackAs, pullAfter, null, ref.refId);
         if (switched && pullAfter) await startSyncJob("pull");
         return;
       }
@@ -2854,6 +2862,7 @@
       stashSwitchDone = stash.noChange
         ? `Switched to ${target.label}. Nothing needed stashing.`
         : `Switched to ${target.label}. Changes stashed — restore them from Stashes when ready.`;
+      rememberGraphCheckout(target.kind === "branch" ? target.requestedRefId : null, snapshot);
       pushToast("success", stash.noChange ? `Switched to ${target.label}` : `Stashed and switched to ${target.label}`);
       clearDiff();
       await reloadAfterMutation();
@@ -2892,7 +2901,13 @@
   /** Branch row showing the checkout spinner (right side) during a switch. */
   let branchBusyRef: string | null = $state(null);
 
-  async function switchBranch(refId: string, trackAs: string | null = null, pullAfter = false, resetAfter: string | null = null): Promise<boolean> {
+  function rememberGraphCheckout(refId: string | null, snapshot: RepoSnapshot): void {
+    graphCheckout = refId !== null && snapshot.head.kind === "branch"
+      ? { refId, headRefId: snapshot.head.refId }
+      : null;
+  }
+
+  async function switchBranch(refId: string, trackAs: string | null = null, pullAfter = false, resetAfter: string | null = null, requestedRefId = refId): Promise<boolean> {
     if (!session || branchBusy) return false;
     // A fresh user switch supersedes any pending reset offer; the reset
     // flow itself keeps its offer until the reset lands.
@@ -2903,7 +2918,7 @@
     const current = session;
     if (shouldOfferStash()) {
       const target = refs.find((r) => r.refId === refId);
-      openStashSwitch({ kind: "branch", refId, label: target?.label ?? refId, trackName: trackAs, pullAfter, resetAfter });
+      openStashSwitch({ kind: "branch", refId, requestedRefId, label: target?.label ?? refId, trackName: trackAs, pullAfter, resetAfter });
       return false;
     }
     branchBusy = true;
@@ -2912,6 +2927,7 @@
     try {
       session = await statusAdapter().branchSwitch(current.repoId, current.version, refId, trackAs);
       if (session === null || session.repoId !== current.repoId) return false;
+      rememberGraphCheckout(requestedRefId, session);
       await reloadAfterMutation();
       // The reset flow toasts the reset itself; a plain switch toasts here.
       if (resetAfter === null) {
@@ -2981,7 +2997,7 @@
     try {
       // Switch first so the reset lands on the twin; a dirty worktree parks
       // the reset behind the stash modal via resetAfter.
-      const switched = await switchBranch(offer.twinRefId, null, false, offer.remoteOid);
+      const switched = await switchBranch(offer.twinRefId, null, false, offer.remoteOid, offer.remoteRefId);
       if (session === null || session.repoId !== current.repoId) return;
       if (!switched) {
         if (stashSwitch === null) {
@@ -3258,6 +3274,9 @@
     if (active) untrack(() => { if (session && !statusLoading) void refreshActivatedRepository(); });
   });
   $effect(() => {
+    if (graphCheckout !== null && preferredGraphRefId === null) graphCheckout = null;
+  });
+  $effect(() => {
     if (diff.selection) untrack(() => closeMerge());
   });
   $effect(() => {
@@ -3510,6 +3529,7 @@
         selectedOid={shell.selectedCommitOid}
         {refLabels}
         {refs}
+        preferredRefId={preferredGraphRefId}
         {scopeValue}
         {scopeOptions}
         onScopeChange={(value) => void applyScope(value)}

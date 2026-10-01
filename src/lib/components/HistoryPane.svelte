@@ -11,7 +11,7 @@
   import ColumnResize from "./ColumnResize.svelte";
   import { COLUMNS_KEY, COLUMN_LIMITS, clampColumn, defaultColumns, restoreColumns, type HistoryColumn } from "../history/columns";
   import { formatDateTime } from "../format/date";
-  import { branchTipPlacement, primaryBadge, refItemForBadge, refsByCommit, type RefBadge } from "../history/refs";
+  import { badgeLabel, branchTipPlacement, primaryBadge, refItemForBadge, refsByCommit, type RefBadge } from "../history/refs";
   import RefKindIcon from "./RefKindIcon.svelte";
   import ContextMenu from "./ContextMenu.svelte";
   import { isContextMenuKey, pointFromContextEvent, type ContextMenuItem } from "../context-menu/model";
@@ -37,6 +37,7 @@
     selectedOid: string | null;
     refLabels: Map<string, string>;
     refs?: RefItem[];
+    preferredRefId?: string | null;
     scopeValue: string;
     scopeOptions: ScopeOption[];
     onScopeChange: (value: string) => void;
@@ -82,6 +83,7 @@
     selectedOid,
     refLabels,
     refs = [],
+    preferredRefId = null,
     scopeValue,
     scopeOptions,
     onScopeChange,
@@ -499,7 +501,7 @@
         {@const laidRow = laidByOid.get(row.oid)}
         {@const badges = badgesFor(row)}
         {@const committedAt = formatDateTime(row.committedAt)}
-        {@const primary = primaryBadge(badges)}
+        {@const primary = primaryBadge(badges, preferredRefId)}
         {@const nodeRadius = row.parents.length > 1 ? 5 : 4}
         {@const nodeX = laneX(laidRow?.lane ?? 0) - graphScrollLeft}
         {@const showBranchLink = primary && laidRow && nodeX >= nodeRadius && nodeX <= graphWidth - nodeRadius}
@@ -535,7 +537,7 @@
                       }
                     }}
                   >
-                    <span class="gd-ref-source"><RefKindIcon kind={primary.kind} /></span><span class="gd-ref-name">{primary.name}</span>
+                    <span class="gd-ref-source"><RefKindIcon kind={primary.kind} /></span><span class="gd-ref-name">{badgeLabel(primary)}</span>
                   </span>
                   {#if badges.length > 1}<span class="gd-ref-extra">+{badges.length - 1}</span>{/if}
                   </span>
@@ -644,7 +646,7 @@
             doubleClickBadge(badge);
           }}
         >
-          <RefKindIcon kind={badge.kind} /><span class="gd-tip-name">{badge.kind === "remote" ? `${badge.source}/${badge.name}` : badge.name}</span>{#if tipRef?.current}<span class="gd-tip-current" aria-label="current">•</span>{/if}
+          <RefKindIcon kind={badge.kind} /><span class="gd-tip-name">{badgeLabel(badge)}</span>{#if tipRef?.current}<span class="gd-tip-current" aria-label="current">•</span>{/if}
         </button>
       {/each}
     </div>
