@@ -37,7 +37,7 @@
   import type { mockAdapter as MockAdapter } from "../lib/ipc/mock";
   import type { WorkspaceState } from "../lib/repositories/tabs";
   import { autoStashMessage, needsStashOffer } from "../lib/repositories/tabs";
-  import { asSyncKind, syncFailureMessage, type SyncKind } from "../lib/sync/errors";
+  import { asSyncKind, shouldOfferPushRecovery, syncFailureMessage, type SyncKind } from "../lib/sync/errors";
   import { BITBUCKET_TOKEN_URL, isBitbucketCloudHttps } from "../lib/sync/bitbucket";
   import { realAdapter } from "../lib/ipc/real";
   import type {
@@ -222,6 +222,16 @@
   let resetOffer: ResetOffer | null = $state(null);
   let resetBusy = $state(false);
   let resetError: AppError | null = $state(null);
+
+  // Push-recovery offer parked when a push job fails diverged (e.g. after an
+  // amend): force-push, pull-and-push, or cancel. Mirrors the reset bar.
+  interface PushOffer {
+    branchLabel: string;
+    remoteLabel: string;
+  }
+  let pushOffer: PushOffer | null = $state(null);
+  let pushBusy: "force" | "pullpush" | null = $state(null);
+  let pushError: AppError | null = $state(null);
 
   // Stash-and-switch offer when the worktree is dirty.
   type StashSwitchTarget =
@@ -571,6 +581,11 @@
       syncError = null;
       syncErrorCode = null;
       syncRetryKind = null;
+      // A manual success retires a stale offer; bar-driven jobs manage it.
+      if (!pushBusy) {
+        pushOffer = null;
+        pushError = null;
+      }
       try {
         if (!demo) session = await realAdapter.repoSnapshot(session.repoId, true);
       } catch {
@@ -580,9 +595,25 @@
       await loadStatus();
       await loadRemoteStatus();
     } else if (record.state === "failed") {
-      syncErrorCode = record.error?.code ?? record.errorCode ?? "GIT_ERROR";
-      syncRetryKind = asSyncKind(record.kind);
-      syncError = syncFailureMessage(record.kind, syncErrorCode, record.error, remoteStatus?.url ?? null);
+      const code = record.error?.code ?? record.errorCode ?? "GIT_ERROR";
+      if (shouldOfferPushRecovery(record.kind, code)) {
+        const wasParked = pushOffer !== null;
+        const head = session?.head;
+        pushOffer = {
+          branchLabel: head?.kind === "branch" ? head.name : "current branch",
+          remoteLabel: remoteStatus?.remoteName ?? "origin"
+        };
+        // A repeat failure while parked shows the backend detail; the first
+        // park keeps the bar's own short copy.
+        pushError = wasParked ? (record.error ?? null) : null;
+        syncError = null;
+        syncErrorCode = null;
+        syncRetryKind = null;
+      } else {
+        syncErrorCode = code;
+        syncRetryKind = asSyncKind(record.kind);
+        syncError = syncFailureMessage(record.kind, code, record.error, remoteStatus?.url ?? null);
+      }
       await loadRemoteStatus();
     } else if (record.state === "cancelled") {
       syncError = `${record.kind} was cancelled.`;
@@ -626,12 +657,17 @@
     }, 600);
   }
 
-  async function startSyncJob(kind: "fetch" | "pull" | "push"): Promise<void> {
+  async function startSyncJob(kind: "fetch" | "pull" | "push", force = false): Promise<void> {
     if (!session || syncJobActive) return;
     const current = session;
     syncError = null;
     syncErrorCode = null;
     syncRetryKind = null;
+    // A fresh manual sync retires a stale offer; bar-driven jobs manage it.
+    if (!pushBusy) {
+      pushOffer = null;
+      pushError = null;
+    }
     try {
       const adapter = syncAdapter();
       const started =
@@ -639,7 +675,9 @@
           ? await adapter.remoteFetch(current.repoId, current.version, null)
           : kind === "pull"
             ? await adapter.remotePull(current.repoId, current.version)
-            : await adapter.remotePush(current.repoId, current.version, null, true);
+            : force
+              ? await adapter.remotePushForce(current.repoId, current.version, null, true)
+              : await adapter.remotePush(current.repoId, current.version, null, true);
       await trackSyncJob(current.repoId, started.operationId);
     } catch (e) {
       if (session === null || session.repoId !== current.repoId) return;
@@ -665,6 +703,63 @@
     } catch (e) {
       syncError = (e as AppError).message ?? "Could not cancel the operation.";
     }
+  }
+
+  /** Start a sync job and resolve once it reaches a terminal state. */
+  async function startSyncJobAndWait(kind: "fetch" | "pull" | "push", force = false): Promise<boolean> {
+    const repoId = session?.repoId ?? null;
+    await startSyncJob(kind, force);
+    if (session === null || session.repoId !== repoId) return false;
+    if (syncError) return false;
+    // The trackSyncJob poll drives syncJob; the bound matches the backend
+    // network timeout so a backend verdict always lands first.
+    for (let i = 0; i < 600 && syncJobActive; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      if (session === null || session.repoId !== repoId) return false;
+    }
+    return !syncJobActive && !syncError;
+  }
+
+  async function confirmPushForce(): Promise<void> {
+    if (!session || !pushOffer || pushBusy || syncJobActive) return;
+    pushBusy = "force";
+    pushError = null;
+    try {
+      if (await startSyncJobAndWait("push", true)) pushOffer = null;
+    } finally {
+      pushBusy = null;
+    }
+  }
+
+  async function confirmPushPullPush(): Promise<void> {
+    if (!session || !pushOffer || pushBusy || syncJobActive) return;
+    const current = session;
+    pushBusy = "pullpush";
+    pushError = null;
+    try {
+      if (!(await startSyncJobAndWait("pull"))) {
+        if (session === null || session.repoId !== current.repoId) return;
+        // The pull failure owns the toolbar; move it into the bar and keep
+        // the offer so force and cancel stay one click away.
+        pushError = syncError
+          ? { code: (syncErrorCode ?? "GIT_ERROR") as AppError["code"], message: syncError, recovery: "refresh", retryable: true }
+          : null;
+        syncError = null;
+        syncErrorCode = null;
+        syncRetryKind = null;
+        return;
+      }
+      if (session === null || session.repoId !== current.repoId) return;
+      if (await startSyncJobAndWait("push")) pushOffer = null;
+    } finally {
+      pushBusy = null;
+    }
+  }
+
+  function cancelPushOffer(): void {
+    if (pushBusy) return;
+    pushOffer = null;
+    pushError = null;
   }
 
   async function loadOperationLog(): Promise<void> {
@@ -3253,6 +3348,25 @@
             </button>
           </div>
         </div>
+      {:else if pushOffer}
+        <div class="gd-pushbar" role="group" aria-label="Push was rejected">
+          <p class="gd-pushbar-text">
+            <strong>Push of {pushOffer.branchLabel} was rejected.</strong>
+            <span>{pushOffer.remoteLabel} has a different tip. Force push overwrites it; pull &amp; push fetches first.</span>
+            {#if pushError}<span class="gd-pushbar-error" role="alert">{pushError.message}</span>{/if}
+          </p>
+          <div class="gd-pushbar-actions">
+            <button type="button" class="gd-pushbar-danger" disabled={pushBusy !== null || syncJobActive} title={`Overwrite ${pushOffer.remoteLabel} ${pushOffer.branchLabel} with your local history`} onclick={() => void confirmPushForce()}>
+              {pushBusy === "force" ? "Force pushing…" : "Force push"}
+            </button>
+            <button type="button" class="gd-pushbar-default" disabled={pushBusy !== null || syncJobActive} title="Pull the remote branch, then push again" onclick={() => void confirmPushPullPush()}>
+              {pushBusy === "pullpush" ? "Pulling & pushing…" : "Pull & push"}
+            </button>
+            <button type="button" class="gd-pushbar-cancel" disabled={pushBusy !== null} onclick={cancelPushOffer}>
+              Cancel
+            </button>
+          </div>
+        </div>
       {:else if workBar && unresolvedFiles === 0}
         <button
           type="button"
@@ -3731,6 +3845,31 @@
   .gd-resetbar-cancel:not(:disabled):hover { background: var(--gd-surface-hover); }
   .gd-resetbar-danger:disabled, .gd-resetbar-cancel:disabled { opacity: .4; cursor: not-allowed; }
   .gd-resetbar-danger:focus-visible, .gd-resetbar-cancel:focus-visible { outline: 2px solid var(--gd-focus); outline-offset: 1px; }
+  .gd-pushbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--gd-space-3);
+    flex: 0 0 auto;
+    min-height: 34px;
+    padding: 5px var(--gd-space-3);
+    color: var(--gd-text);
+    background: color-mix(in srgb, var(--gd-warning) 10%, var(--gd-surface-raised));
+    border: 0;
+    border-bottom: 1px solid var(--gd-border);
+    font-size: var(--gd-font-size-small);
+  }
+  .gd-pushbar-text { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; margin: 0; min-width: 0; }
+  .gd-pushbar-text strong { font-weight: 600; }
+  .gd-pushbar-text > span { color: var(--gd-text-secondary); }
+  .gd-pushbar-text .gd-pushbar-error { color: var(--gd-danger); }
+  .gd-pushbar-actions { display: flex; gap: 8px; flex: 0 0 auto; }
+  .gd-pushbar-danger, .gd-pushbar-default, .gd-pushbar-cancel { height: 26px; padding: 0 10px; background: transparent; border: 1px solid var(--gd-border); border-radius: 4px; color: var(--gd-text); cursor: pointer; font: 11px var(--gd-font-ui); }
+  .gd-pushbar-danger { border-color: var(--gd-danger); color: var(--gd-danger); font-weight: 600; }
+  .gd-pushbar-danger:not(:disabled):hover { background: color-mix(in srgb, var(--gd-danger) 12%, transparent); }
+  .gd-pushbar-default:not(:disabled):hover, .gd-pushbar-cancel:not(:disabled):hover { background: var(--gd-surface-hover); }
+  .gd-pushbar-danger:disabled, .gd-pushbar-default:disabled, .gd-pushbar-cancel:disabled { opacity: .4; cursor: not-allowed; }
+  .gd-pushbar-danger:focus-visible, .gd-pushbar-default:focus-visible, .gd-pushbar-cancel:focus-visible { outline: 2px solid var(--gd-focus); outline-offset: 1px; }
   .gd-trust-bar {
     display: flex;
     align-items: center;

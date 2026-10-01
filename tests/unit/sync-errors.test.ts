@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { asSyncKind, syncFailureMessage } from "../../src/lib/sync/errors";
+import { asSyncKind, shouldOfferPushRecovery, syncFailureMessage } from "../../src/lib/sync/errors";
 
 describe("sync failure presentation", () => {
   it("gives HTTPS credential-helper recovery without exposing the remote", () => {
@@ -19,5 +19,14 @@ describe("sync failure presentation", () => {
     expect(syncFailureMessage("push", "GIT_ERROR", error, null)).toBe("Safe failure");
     expect(asSyncKind("push")).toBe("push");
     expect(asSyncKind("clone")).toBeNull();
+  });
+
+  it("offers push recovery only for a rejected push", () => {
+    expect(shouldOfferPushRecovery("push", "DIVERGED")).toBe(true);
+    expect(shouldOfferPushRecovery("push", "AUTH_REQUIRED")).toBe(false);
+    expect(shouldOfferPushRecovery("pull", "DIVERGED")).toBe(false);
+    expect(shouldOfferPushRecovery(null, "DIVERGED")).toBe(false);
+    expect(shouldOfferPushRecovery("push", null)).toBe(false);
+    expect(shouldOfferPushRecovery(undefined, undefined)).toBe(false);
   });
 });

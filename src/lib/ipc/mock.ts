@@ -470,6 +470,10 @@ const mockAdapter = {
     await new Promise((resolve) => setTimeout(resolve, 10));
     return { operationId: "demo-push-1" };
   },
+  async remotePushForce(_repoId: string, _expectedVersion: number, _remote: string | null, _setUpstream: boolean): Promise<OperationStarted> {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    return { operationId: "demo-push-force-1" };
+  },
   async stashList(_repoId: string): Promise<StashEntry[]> {
     await new Promise((resolve) => setTimeout(resolve, 10));
     return [

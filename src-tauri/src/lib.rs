@@ -79,6 +79,7 @@ pub fn run() {
             remote_fetch,
             remote_pull,
             remote_push,
+            remote_push_force,
             operation_log,
             stash_list,
             stash_save,

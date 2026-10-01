@@ -44,3 +44,15 @@ export function syncFailureMessage(
 export function asSyncKind(value: string): SyncKind | null {
   return value === "fetch" || value === "pull" || value === "push" ? value : null;
 }
+
+/**
+ * A rejected push (remote tip differs, e.g. after an amend) parks the
+ * push-recovery bar with force / pull-and-push / cancel instead of the
+ * plain toolbar error. Other kinds and codes keep the existing display.
+ */
+export function shouldOfferPushRecovery(
+  kind: string | null | undefined,
+  code: string | null | undefined
+): boolean {
+  return kind === "push" && code === "DIVERGED";
+}

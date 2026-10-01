@@ -392,6 +392,15 @@ export const realAdapter = {
       setUpstream
     });
   },
+  async remotePushForce(repoId: RepoId, expectedVersion: number, remote: string | null, setUpstream: boolean): Promise<OperationStarted> {
+    return invokeCommand<OperationStarted>("remote_push_force", {
+      requestId: newRequestId(),
+      repoId,
+      expectedVersion,
+      remote,
+      setUpstream
+    });
+  },
   async operationLog(repoId: RepoId, cursor: number): Promise<OperationLogPage> {
     return invokeCommand<OperationLogPage>("operation_log", {
       requestId: newRequestId(),
