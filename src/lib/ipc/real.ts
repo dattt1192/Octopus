@@ -671,11 +671,11 @@ export const realAdapter = {
   async settingsGet(): Promise<SettingsV1> {
     return invokeCommand<SettingsV1>("settings_get", { requestId: newRequestId() });
   },
-  async settingsUpdate(settingsVersion: number, fontScale: number | null): Promise<SettingsV1> {
+  async settingsUpdate(settingsVersion: number, fontScale: number | null, autoFetchMinutes: number | null = null): Promise<SettingsV1> {
     return invokeCommand<SettingsV1>("settings_update", {
       requestId: newRequestId(),
       settingsVersion,
-      patch: { fontScale }
+      patch: { fontScale, autoFetchMinutes }
     });
   }
 };

@@ -435,6 +435,8 @@ export interface MergeStartResult {
 export interface SettingsV1 {
   version: number;
   fontScale: number;
+  /** 0 disables automatic fetch. Otherwise 1, 5, 10 or 15 minutes. */
+  autoFetchMinutes: number;
 }
 
 export interface MergeCompleteResult {

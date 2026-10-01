@@ -63,7 +63,7 @@ function demoRows(): CommitRow[] {
   }));
 }
 
-let mockSettings: SettingsV1 = { version: 1, fontScale: 1 };
+let mockSettings: SettingsV1 = { version: 1, fontScale: 1, autoFetchMinutes: 5 };
 
 /**
  * Explicit browser demo / test adapter. Shares the same DTOs as the real
@@ -72,6 +72,8 @@ let mockSettings: SettingsV1 = { version: 1, fontScale: 1 };
 export function createMockAdapter(seed: RepoSnapshot = initialDemoSession) {
 const demoSession = structuredClone(seed);
 let conflictDoc: ConflictHunks | null = null;
+let syncCounter = 0;
+let lastFetchAt = "2026-09-22T10:00:00Z";
 let commitRows = demoRows();
 const commitBodies = new Map<string, string>();
 const supersededCommits = new Map<string, CommitRow>();
@@ -407,7 +409,7 @@ const mockAdapter = {
       operationId,
       requestId: "demo-request",
       repoId: null,
-      kind: "demo.noop",
+      kind: operationId.startsWith("demo-fetch-") ? "fetch" : operationId.startsWith("demo-pull-") ? "pull" : operationId.startsWith("demo-push-") ? "push" : "demo.noop",
       state: "succeeded",
       stage: "done",
       progress: null,
@@ -426,7 +428,7 @@ const mockAdapter = {
       upstreamRef: "origin/main",
       ahead: 1,
       behind: 2,
-      lastFetchAt: "2026-09-22T10:00:00Z"
+      lastFetchAt
     };
   },
   async bitbucketConnect(
@@ -460,15 +462,16 @@ const mockAdapter = {
   },
   async remoteFetch(_repoId: string, _expectedVersion: number, _remote: string | null): Promise<OperationStarted> {
     await new Promise((resolve) => setTimeout(resolve, 10));
-    return { operationId: "demo-fetch-1" };
+    lastFetchAt = new Date().toISOString();
+    return { operationId: `demo-fetch-${++syncCounter}` };
   },
   async remotePull(_repoId: string, _expectedVersion: number): Promise<OperationStarted> {
     await new Promise((resolve) => setTimeout(resolve, 10));
-    return { operationId: "demo-pull-1" };
+    return { operationId: `demo-pull-${++syncCounter}` };
   },
   async remotePush(_repoId: string, _expectedVersion: number, _remote: string | null, _setUpstream: boolean): Promise<OperationStarted> {
     await new Promise((resolve) => setTimeout(resolve, 10));
-    return { operationId: "demo-push-1" };
+    return { operationId: `demo-push-${++syncCounter}` };
   },
   async remotePushForce(_repoId: string, _expectedVersion: number, _remote: string | null, _setUpstream: boolean): Promise<OperationStarted> {
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -759,15 +762,22 @@ const mockAdapter = {
     await new Promise((resolve) => setTimeout(resolve, 10));
     return { ...mockSettings };
   },
-  async settingsUpdate(settingsVersion: number, fontScale: number | null): Promise<SettingsV1> {
+  async settingsUpdate(settingsVersion: number, fontScale: number | null, autoFetchMinutes: number | null = null): Promise<SettingsV1> {
     await new Promise((resolve) => setTimeout(resolve, 10));
     if (mockSettings.version !== settingsVersion) {
       throw { code: "STALE_STATE", message: "Settings changed under you; reload and retry.", recovery: "refresh", retryable: false };
     }
-    if (fontScale === null || !Number.isFinite(fontScale) || fontScale < 0.875 || fontScale > 1.25) {
+    if (fontScale === null && autoFetchMinutes === null) {
+      throw { code: "INVALID_ARGUMENT", message: "Set at least one settings field.", recovery: "inspectState", retryable: false };
+    }
+    if (fontScale !== null && (!Number.isFinite(fontScale) || fontScale < 0.875 || fontScale > 1.25)) {
       throw { code: "INVALID_ARGUMENT", message: "Font scale must be between 0.875 and 1.25.", recovery: "inspectState", retryable: false };
     }
-    mockSettings = { version: mockSettings.version + 1, fontScale };
+    if (autoFetchMinutes !== null && ![0, 1, 5, 10, 15].includes(autoFetchMinutes)) {
+      throw { code: "INVALID_ARGUMENT", message: "Auto fetch must be off, or every 1, 5, 10 or 15 minutes.", recovery: "inspectState", retryable: false };
+    }
+    mockSettings = { version: mockSettings.version + 1, fontScale: fontScale ?? mockSettings.fontScale,
+      autoFetchMinutes: autoFetchMinutes ?? mockSettings.autoFetchMinutes };
     return { ...mockSettings };
   },
   async operationLog(_repoId: string, _cursor: number): Promise<OperationLogPage> {
